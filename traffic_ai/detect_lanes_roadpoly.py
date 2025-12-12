@@ -1,36 +1,31 @@
 from ultralytics import YOLO
 import cv2
 import os
+import csv
 import numpy as np
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Optional
 
-
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-VIDEO_SOURCE = os.path.join(BASE_DIR, "data", "video", "test 2.mp4")
-DISPLAY_SCALE = 0.6  # thu nhỏ terminal 
+VIDEO_SOURCE = os.path.join(BASE_DIR, "data", "video", "test 1.mp4")
+DISPLAY_SCALE = 0.6
 
-print("[DEBUG] VIDEO_SOURCE =", VIDEO_SOURCE)
-print("[DEBUG] File video tồn tại? :", os.path.exists(VIDEO_SOURCE))
+# Output
+OUTPUT_DIR = os.path.join(BASE_DIR, "output")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+VIOLATION_CSV = os.path.join(OUTPUT_DIR, "violations_log.csv")
 
-
-# lấy frame 
+# Road polygon (norm 0..1): [left_bottom, right_bottom, right_top, left_top]
 ROAD_POLY_NORM = [
-    (0.0719, 0.9454),
-    (0.5984, 0.9704),
-    (0.5927, 0.5370),
-    (0.4484, 0.5315),
-]
-# lấy lane chia 1 2 3
-BOUNDARY_TS = [
-    0.0000,
-    0.2683,
-    0.6335,
-    1.0000,
+    (0.2250, 0.9583),
+    (0.7417, 0.9704),
+    (0.5620, 0.4481),
+    (0.4354, 0.4574),
 ]
 
-# Kiểu lane tương ứng từng khoảng [ti, ti+1]
-LANE_TYPES = ["motorbike", "car", "car"]  
+# Lane boundaries t: 0..1 along left->right edge
+BOUNDARY_TS = [0.0000, 0.3224, 0.6289, 1.0000]
+LANE_TYPES = ["car", "car", "motorbike"]
 
 
 def lerp(p1, p2, t: float):
@@ -38,19 +33,12 @@ def lerp(p1, p2, t: float):
             p1[1] + (p2[1] - p1[1]) * t)
 
 
-def generate_lane_polys_norm(
-    road_poly_norm: List[Tuple[float, float]],
-    boundary_ts: List[float],
-    lane_types: List[str],
-):
-    
-    assert len(road_poly_norm) == 4, "ROAD_POLY_NORM phải có 4 điểm."
+def generate_lane_polys_norm(road_poly_norm, boundary_ts, lane_types):
     lb, rb, rt, lt = road_poly_norm
 
     boundary_ts = [max(0.0, min(1.0, float(t))) for t in boundary_ts]
     boundary_ts = sorted(boundary_ts)
     num_lanes = len(boundary_ts) - 1
-    assert num_lanes >= 1, "Cần ít nhất 1 lane."
 
     if len(lane_types) < num_lanes:
         lane_types = lane_types + ["car"] * (num_lanes - len(lane_types))
@@ -68,30 +56,22 @@ def generate_lane_polys_norm(
         t_right_pt = lerp(lt, rt, t_right)
         t_left_pt = lerp(lt, rt, t_left)
 
-        poly_norm = [b_left, b_right, t_right_pt, t_left_pt]
-
-        lanes.append(
-            {
-                "id": lane_id,
-                "name": f"L{lane_id}",  
-                "type": lane_type,
-                "poly_norm": poly_norm,
-            }
-        )
-
+        lanes.append({
+            "id": lane_id,
+            "name": f"L{lane_id}",
+            "type": lane_type,
+            "poly_norm": [b_left, b_right, t_right_pt, t_left_pt]
+        })
     return lanes
 
 
-LANES_CONFIG = generate_lane_polys_norm(
-    ROAD_POLY_NORM, BOUNDARY_TS, LANE_TYPES
-)
+LANES_CONFIG = generate_lane_polys_norm(ROAD_POLY_NORM, BOUNDARY_TS, LANE_TYPES)
 
 
-def build_allowed_lanes_by_class(lanes_cfg) -> Dict[str, set]:
+def build_allowed_lanes_by_class(lanes_cfg):
     lanes_by_type: Dict[str, List[int]] = {}
     for lane in lanes_cfg:
-        t = lane.get("type", "unknown")
-        lanes_by_type.setdefault(t, []).append(lane["id"])
+        lanes_by_type.setdefault(lane.get("type", "unknown"), []).append(lane["id"])
 
     car_lanes = set(lanes_by_type.get("car", []))
     bike_lanes = set(lanes_by_type.get("motorbike", []))
@@ -137,50 +117,47 @@ def iou(box1, box2) -> float:
 
     inter_w = max(0.0, xi2 - xi1)
     inter_h = max(0.0, yi2 - yi1)
-    inter_area = inter_w * inter_h
-    if inter_area <= 0:
+    inter = inter_w * inter_h
+    if inter <= 0:
         return 0.0
 
-    box1_area = (x2 - x1) * (y2 - y1)
-    box2_area = (x2g - x1g) * (y2g - y1g)
-    union = box1_area + box2_area - inter_area
-    if union <= 0:
-        return 0.0
-
-    return inter_area / union
+    a1 = (x2 - x1) * (y2 - y1)
+    a2 = (x2g - x1g) * (y2g - y1g)
+    u = a1 + a2 - inter
+    return inter / (u + 1e-8)
 
 
 class SimpleTracker:
-    def __init__(self, iou_threshold: float = 0.3, max_missed: int = 10):
+    def __init__(self, iou_threshold=0.3, max_missed=10):
         self.iou_threshold = iou_threshold
         self.max_missed = max_missed
         self.tracks: Dict[int, Track] = {}
-        self.next_id: int = 1
+        self.next_id = 1
 
     def update(self, detections: List[Detection]) -> List[Track]:
         if not self.tracks:
             for det in detections:
-                self._create_track(det)
+                self._create(det)
             return list(self.tracks.values())
 
-        unmatched_dets = list(range(len(detections)))
+        unmatched = list(range(len(detections)))
         track_ids = list(self.tracks.keys())
         matches: Dict[int, int] = {}
 
         for tid in track_ids:
             best_iou = 0.0
             best_idx = -1
-            for di in unmatched_dets:
-                i = iou(self.tracks[tid].bbox, detections[di].bbox)
-                if i > best_iou:
-                    best_iou = i
+            for di in unmatched:
+                v = iou(self.tracks[tid].bbox, detections[di].bbox)
+                if v > best_iou:
+                    best_iou = v
                     best_idx = di
             if best_idx >= 0 and best_iou >= self.iou_threshold:
                 matches[tid] = best_idx
-                unmatched_dets.remove(best_idx)
+                unmatched.remove(best_idx)
 
-        for tid, det_idx in matches.items():
-            det = detections[det_idx]
+        for tid, di in matches.items():
+            det = detections[di]
             tr = self.tracks[tid]
             tr.bbox = det.bbox
             tr.cls_name = det.cls_name
@@ -191,27 +168,19 @@ class SimpleTracker:
             if tid not in matches:
                 self.tracks[tid].missed += 1
 
-        to_delete = [tid for tid, tr in self.tracks.items()
-                     if tr.missed > self.max_missed]
-        for tid in to_delete:
+        for tid in [tid for tid, tr in self.tracks.items() if tr.missed > self.max_missed]:
             del self.tracks[tid]
 
-        for di in unmatched_dets:
-            self._create_track(detections[di])
+        for di in unmatched:
+            self._create(detections[di])
 
         return list(self.tracks.values())
 
-    def _create_track(self, det: Detection):
+    def _create(self, det: Detection):
         tid = self.next_id
         self.next_id += 1
-        self.tracks[tid] = Track(
-            track_id=tid,
-            bbox=det.bbox,
-            cls_name=det.cls_name,
-            conf=det.conf,
-        )
+        self.tracks[tid] = Track(tid, det.bbox, det.cls_name, det.conf)
 
-#làn xe 
 
 def denorm_polygon(poly_norm, w: int, h: int):
     return [(int(x * w), int(y * h)) for x, y in poly_norm]
@@ -223,13 +192,12 @@ def point_in_poly(x: float, y: float, poly: List[Tuple[int, int]]) -> bool:
     for i in range(n):
         x1, y1 = poly[i]
         x2, y2 = poly[(i + 1) % n]
-        if ((y1 > y) != (y2 > y)) and \
-           (x < (x2 - x1) * (y - y1) / (y2 - y1 + 1e-8) + x1):
+        if ((y1 > y) != (y2 > y)) and (x < (x2 - x1) * (y - y1) / (y2 - y1 + 1e-8) + x1):
             inside = not inside
     return inside
 
 
-def assign_lane_to_track(track: Track, lanes_pixel: List[dict]) -> Optional[int]:
+def assign_lane(track: Track, lanes_pixel: List[dict]) -> Optional[int]:
     x1, y1, x2, y2 = track.bbox
     cx = (x1 + x2) / 2.0
     cy = (y1 + y2) / 2.0
@@ -239,177 +207,150 @@ def assign_lane_to_track(track: Track, lanes_pixel: List[dict]) -> Optional[int]
     return None
 
 
-def check_lane_violation(track: Track) -> bool:
+def is_violation(track: Track) -> bool:
     allowed = ALLOWED_LANES_BY_CLASS.get(track.cls_name)
-    if not allowed:
-        return False
-    if track.lane_id is None:
+    if not allowed or track.lane_id is None:
         return False
     return track.lane_id not in allowed
 
 
-
-
 def main():
-    print("[INFO] Đang load YOLOv8...")
-    model = YOLO("yolov8n.pt")
+    print("[INFO] VIDEO_SOURCE:", VIDEO_SOURCE)
+    print("[INFO] CSV output:", VIOLATION_CSV)
 
+    model = YOLO("yolov8n.pt")
     cap = cv2.VideoCapture(VIDEO_SOURCE)
     if not cap.isOpened():
-        print(f"[ERROR] Không mở được video: {VIDEO_SOURCE}")
+        print("[ERROR] Không mở được video:", VIDEO_SOURCE)
         return
 
-    target_classes = {"car", "motorbike", "bus", "truck"}
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps <= 0:
+        fps = 30.0
+
     tracker = SimpleTracker(iou_threshold=0.3, max_missed=10)
+    target_classes = {"car", "motorbike", "bus", "truck"}
 
-    cv2.namedWindow("YOLOv8 Lane RoadPoly Demo", cv2.WINDOW_NORMAL)
-    print("[INFO] Bắt đầu. Nhấn 'q' để thoát.")
-
+    logged_violation_ids = set()  # track_id đã log 1 lần
     frame_idx = 0
-    total_violations = 0
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("[INFO] Hết video.")
-            break
-        frame_idx += 1
+    with open(VIOLATION_CSV, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["frame", "time_sec", "track_id", "class", "lane_id", "lane_type"])
 
-        h, w = frame.shape[:2]
+        cv2.namedWindow("Lane Violation Demo", cv2.WINDOW_NORMAL)
 
-        # Lane polygon pixel
-        lanes_pixel = []
-        lane_type_by_id: Dict[int, str] = {}
-        for lane_cfg in LANES_CONFIG:
-            pts = denorm_polygon(lane_cfg["poly_norm"], w, h)
-            lane = {
-                "id": lane_cfg["id"],
-                "name": lane_cfg["name"],
-                "type": lane_cfg.get("type", "unknown"),
-                "poly": pts,
-            }
-            lanes_pixel.append(lane)
-            lane_type_by_id[lane["id"]] = lane["type"]
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frame_idx += 1
+            time_sec = frame_idx / fps
 
-        # Road polygon (viền ngoài)
-        road_pts = denorm_polygon(ROAD_POLY_NORM, w, h)
-        cv2.polylines(
-            frame,
-            [np.array(road_pts, dtype=np.int32).reshape(-1, 1, 2)],
-            True,
-            (255, 255, 0),
-            2,
-        )
+            h, w = frame.shape[:2]
 
-        # YOLO detection
-        results = model(frame, conf=0.4)[0]
-        detections: List[Detection] = []
-        for box in results.boxes:
-            cls_id = int(box.cls[0])
-            cls_name = model.names[cls_id]
-            if cls_name not in target_classes:
-                continue
-            x1, y1, x2, y2 = map(float, box.xyxy[0])
-            conf = float(box.conf[0])
-            detections.append(Detection((x1, y1, x2, y2), cls_name, conf))
+            # lanes pixel
+            lanes_pixel = []
+            lane_type_by_id = {}
+            for lane_cfg in LANES_CONFIG:
+                pts = denorm_polygon(lane_cfg["poly_norm"], w, h)
+                lanes_pixel.append({
+                    "id": lane_cfg["id"],
+                    "name": lane_cfg["name"],
+                    "type": lane_cfg["type"],
+                    "poly": pts,
+                })
+                lane_type_by_id[lane_cfg["id"]] = lane_cfg["type"]
 
-        # Tracking
-        tracks = tracker.update(detections)
+            # draw road boundary
+            road_pts = denorm_polygon(ROAD_POLY_NORM, w, h)
+            cv2.polylines(frame, [np.array(road_pts, np.int32).reshape(-1, 1, 2)], True, (255, 255, 0), 2)
 
-        # Gán lane + check violation
-        violations_frame = 0
-        for tr in tracks:
-            tr.lane_id = assign_lane_to_track(tr, lanes_pixel)
-            tr.lane_type = lane_type_by_id.get(tr.lane_id) if tr.lane_id else None
-            tr.is_violation = check_lane_violation(tr)
-            if tr.is_violation:
-                violations_frame += 1
-        total_violations += violations_frame
+            # YOLO detect
+            results = model(frame, conf=0.4)[0]
+            detections: List[Detection] = []
+            for box in results.boxes:
+                cls_id = int(box.cls[0])
+                cls_name = model.names[cls_id]
+                if cls_name not in target_classes:
+                    continue
+                x1, y1, x2, y2 = map(float, box.xyxy[0])
+                conf = float(box.conf[0])
+                detections.append(Detection((x1, y1, x2, y2), cls_name, conf))
 
-        # Vẽ lane (hình thang + label L1/L2/L3)
-        for lane in lanes_pixel:
-            pts = np.array(lane["poly"], dtype=np.int32).reshape(-1, 1, 2)
+            tracks = tracker.update(detections)
 
-            lane_type = lane["type"]
-            if lane_type == "car":
-                color = (255, 0, 0)
-            elif lane_type == "motorbike":
-                color = (0, 255, 255)
-            else:
-                color = (255, 255, 255)
+            # counts
+            lane_counts = {lane["id"]: 0 for lane in lanes_pixel}
+            violations_frame = 0
+            total_unique = len(logged_violation_ids)
 
-            cv2.polylines(frame, [pts], True, color, 2)
+            # assign lane + log
+            for tr in tracks:
+                tr.lane_id = assign_lane(tr, lanes_pixel)
+                tr.lane_type = lane_type_by_id.get(tr.lane_id) if tr.lane_id else None
+                tr.is_violation = is_violation(tr)
 
-            cx = int(sum(p[0] for p in lane["poly"]) / len(lane["poly"]))
-            cy = int(sum(p[1] for p in lane["poly"]) / len(lane["poly"]))
-            cv2.putText(
-                frame,
-                lane["name"],
-                (cx - 20, cy - 10),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                color,
-                2,
-                cv2.LINE_AA,
-            )
+                if tr.lane_id is not None:
+                    lane_counts[tr.lane_id] += 1
 
-        # Vẽ xe: chỉ hiển thị text khi VIOLATION
-        for tr in tracks:
-            x1, y1, x2, y2 = map(int, tr.bbox)
-            if tr.is_violation:
-                color = (0, 0, 255)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                cv2.putText(
-                    frame,
-                    "WRONG LANE",
-                    (x1, max(20, y1 - 8)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    color,
-                    2,
-                    cv2.LINE_AA,
-                )
-            else:
-                # chỉ khung xanh, không text để đỡ rối
-                color = (0, 255, 0)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                if tr.is_violation:
+                    violations_frame += 1
+                    if tr.track_id not in logged_violation_ids:
+                        writer.writerow([frame_idx, round(time_sec, 2), tr.track_id, tr.cls_name, tr.lane_id, tr.lane_type])
+                        logged_violation_ids.add(tr.track_id)
+                        total_unique += 1
 
-        # Info góc trên trái
-        info1 = f"Frame: {frame_idx}"
-        info2 = f"Vehicles: {len(tracks)}   Violations(frame): {violations_frame}"
-        cv2.putText(
-            frame,
-            info1,
-            (20, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
-        cv2.putText(
-            frame,
-            info2,
-            (20, 60),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
+            # draw lanes
+            for lane in lanes_pixel:
+                pts = np.array(lane["poly"], np.int32).reshape(-1, 1, 2)
+                t = lane["type"]
+                if t == "car":
+                    color = (255, 0, 0)
+                elif t == "motorbike":
+                    color = (0, 255, 255)
+                else:
+                    color = (255, 255, 255)
+                cv2.polylines(frame, [pts], True, color, 2)
 
-        # Thu nhỏ hiển thị
-        new_w, new_h = int(w * DISPLAY_SCALE), int(h * DISPLAY_SCALE)
-        frame_display = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+                cx = int(sum(p[0] for p in lane["poly"]) / len(lane["poly"]))
+                cy = int(sum(p[1] for p in lane["poly"]) / len(lane["poly"]))
+                cv2.putText(frame, lane["name"], (cx - 18, cy - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
 
-        cv2.imshow("YOLOv8 Lane RoadPoly Demo", frame_display)
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
+            # draw vehicles (text only for violation)
+            for tr in tracks:
+                x1, y1, x2, y2 = map(int, tr.bbox)
+                if tr.is_violation:
+                    color = (0, 0, 255)
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                    cv2.putText(frame, "WRONG LANE", (x1, max(20, y1 - 8)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
+                else:
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+            # overlay summary
+            l1 = lane_counts.get(1, 0)
+            l2 = lane_counts.get(2, 0)
+            l3 = lane_counts.get(3, 0)
+            info1 = f"Frame: {frame_idx}  t={time_sec:5.1f}s"
+            info2 = f"L1:{l1:2}  L2:{l2:2}  L3:{l3:2}  Veh:{len(tracks):2}"
+            info3 = f"Viol(frame): {violations_frame}  Viol(total): {len(logged_violation_ids)}"
+            cv2.putText(frame, info1, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(frame, info2, (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(frame, info3, (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
+
+            # show
+            new_w, new_h = int(w * DISPLAY_SCALE), int(h * DISPLAY_SCALE)
+            disp = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            cv2.imshow("Lane Violation Demo", disp)
+
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
 
     cap.release()
     cv2.destroyAllWindows()
-    print("[INFO] Đã thoát.")
-    print("[INFO] Tổng số vi phạm (đếm theo frame):", total_violations)
+    print("[INFO] Saved:", VIOLATION_CSV)
 
 
 if __name__ == "__main__":

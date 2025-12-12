@@ -1,0 +1,4 @@
+frame,time_sec,track_id,class,lane_id,lane_type
+1,0.03,7,car,3,motorbike
+1,0.03,9,car,3,motorbike
+45,1.5,3,car,3,motorbike
