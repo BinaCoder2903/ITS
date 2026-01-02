@@ -16,21 +16,25 @@ YOLO_WEIGHTS = "yolov8n.pt"
 TRACKER_CFG = "bytetrack.yaml"
 
 # Speed
-WORK_SCALE = 0.85          # scale xử lý (warp + yolo + draw). 0.75~1.0
-DISPLAY_SCALE = 0.85       # scale hiển thị
-IMGSZ = 384                # 480->416->384 nếu lag
-CONF_TH = 0.35
-MAX_DET = 30
-TARGET_CLASS_IDS = [2, 3, 5, 7]  # car, motorcycle, bus, truck (COCO)
+WORK_SCALE = 0.85
+DISPLAY_SCALE = 0.85
+IMGSZ = 384
+
+# >>> Xe máy thường nhỏ/xa => nên hạ conf + tăng max_det để khỏi rớt
+CONF_TH = 0.25
+MAX_DET = 60
+
+# car=2, motorcycle=3, bus=5, truck=7 (COCO)
+TARGET_CLASS_IDS = [2, 3, 5, 7]
 
 # Smoothing bbox (EMA)
-SMOOTH_ALPHA = 0.65        # 0..1
+SMOOTH_ALPHA = 0.65
 
 # Warp chống lệch lane do zoom / rung
 USE_WARP = True
-WARP_UPDATE_EVERY = 30     # 10->30/45 để hết khựng theo chu kỳ
-WARP_SCALE = 0.55          # warp chạy trên ảnh nhỏ (0.5~0.65)
-ROI_YMAX = 0.60            # lấy feature phía trên (tránh xe làm nhiễu)
+WARP_UPDATE_EVERY = 30
+WARP_SCALE = 0.55
+ROI_YMAX = 0.60
 
 MIN_GOOD_MATCHES = 50
 MIN_INLIER_RATIO = 0.25
@@ -39,15 +43,18 @@ REBASE_FAILS = 25
 
 # Mask biển số
 MASK_PLATE = True
-MASK_MODE = "fill"         # "fill" nhanh nhất; "blur" nặng hơn
+MASK_MODE = "fill"
 MASK_NEAR_ONLY = True
-MASK_NEAR_Y2_NORM = 0.72   # chỉ mask nếu đáy bbox nằm dưới 72% chiều cao ảnh
-MASK_NEAR_MIN_H = 120      # hoặc bbox cao >= 120px
+MASK_NEAR_Y2_NORM = 0.72
+MASK_NEAR_MIN_H = 120
 
 # Output log
 SAVE_VIOLATIONS = True
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 LOG_CSV = os.path.join(OUTPUT_DIR, "violations_log.csv")
+
+# Hiển thị label hitbox
+DRAW_LABELS = True
 
 # OpenCV / torch threads (giảm giật)
 try:
@@ -65,20 +72,14 @@ except Exception:
 # order: left_bottom, right_bottom, right_top, left_top
 # =========================
 ROAD_POLY_NORM = [
-    (0.2333, 0.8870),
-    (0.9891, 0.9000),
-    (0.7078, 0.4231),
-    (0.3906, 0.4278),
+    (0.1224, 0.9111),
+    (0.9891, 0.9046),
+    (0.7052, 0.4157),
+    (0.3443, 0.4343),
 ]
 
-BOUNDARY_TS = [
-    0.0000,
-    0.2194,
-    0.4742,
-    0.7374,
-    1.0000,
-]
-LANE_TYPES = ["car", "car", "car"]  # ví dụ: ["car","car","motorcycle"]
+BOUNDARY_TS = [0.0000, 0.2194, 0.4742, 0.7374, 1.0000]
+LANE_TYPES = ["motorcycle", "motorcycle", "car", "car"]  # 4 lanes => cần 4 type (n = len(ts)-1)
 
 # =========================
 # Helpers (geometry)
@@ -173,11 +174,9 @@ def mask_plate(img, bbox):
 
     bw = max(1, x2 - x1)
     bh = max(1, y2 - y1)
-
     if bh < 80:  # xe rất xa -> khỏi mask
         return
 
-    # vùng biển số (nhỏ hơn để khỏi “khối đen to”)
     px1 = int(x1 + 0.28 * bw)
     px2 = int(x1 + 0.72 * bw)
     py1 = int(y1 + 0.72 * bh)
@@ -217,7 +216,6 @@ class ReferenceHomographyWarp:
         ref_gray_full = cv2.cvtColor(ref_frame_bgr, cv2.COLOR_BGR2GRAY)
         h, w = ref_gray_full.shape[:2]
 
-        # mask: lấy phần trên + bỏ vùng road (xe chạy)
         mask_full = np.zeros((h, w), dtype=np.uint8)
         cv2.rectangle(mask_full, (0, 0), (w, int(h * roi_ymax)), 255, -1)
         road_cnt = np.array(road_poly_px, dtype=np.int32).reshape(-1, 1, 2)
@@ -279,7 +277,6 @@ class ReferenceHomographyWarp:
 
         H_new = H_new.astype(np.float32)
 
-        # convert scaled-H -> full-res H
         if self.warp_scale != 1.0:
             s = self.warp_scale
             S = np.array([[s, 0, 0],
@@ -290,7 +287,6 @@ class ReferenceHomographyWarp:
                              [0, 0, 1]], dtype=np.float32)
             H_new = Sinv @ H_new @ S
 
-        # smooth
         H_new = H_new / (H_new[2, 2] + 1e-8)
         H_old = self.H / (self.H[2, 2] + 1e-8)
         H_blend = (1.0 - self.smooth_gamma) * H_old + self.smooth_gamma * H_new
@@ -320,6 +316,29 @@ class BoxSmoother:
         return sm
 
 # =========================
+# Draw helpers (hitbox color/label)
+# =========================
+def norm_class_name(name: str) -> str:
+    if name in ("motorbike", "motorcycle"):
+        return "motorcycle"
+    return name
+
+# BGR colors
+BASE_COLORS = {
+    "car": (0, 255, 0),         # green
+    "motorcycle": (255, 255, 0),# cyan-ish
+    "bus": (0, 255, 255),       # yellow
+    "truck": (0, 165, 255),     # orange
+}
+
+def draw_label(img, x1, y1, text, color):
+    # nền label
+    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+    y1t = max(0, y1 - th - 6)
+    cv2.rectangle(img, (x1, y1t), (x1 + tw + 6, y1t + th + 6), color, -1)
+    cv2.putText(img, text, (x1 + 3, y1t + th + 2), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
+
+# =========================
 # MAIN
 # =========================
 def main():
@@ -340,19 +359,16 @@ def main():
         print("[ERROR] Cannot read first frame")
         return
 
-    # scale working frame
     if WORK_SCALE != 1.0:
         f0 = cv2.resize(f0, None, fx=WORK_SCALE, fy=WORK_SCALE, interpolation=cv2.INTER_AREA)
 
     Hh, Ww = f0.shape[:2]
-
     road_ref_px = denorm_polygon(ROAD_POLY_NORM, Ww, Hh)
     lanes_ref_px = generate_lane_polys_pixel(road_ref_px, BOUNDARY_TS, LANE_TYPES)
     allowed_lanes_by_cls = build_allowed_lanes(lanes_ref_px)
 
     warp = ReferenceHomographyWarp(
-        f0,
-        road_ref_px,
+        f0, road_ref_px,
         roi_ymax=ROI_YMAX,
         warp_scale=WARP_SCALE,
         min_good=MIN_GOOD_MATCHES,
@@ -363,7 +379,6 @@ def main():
 
     smoother = BoxSmoother(alpha=SMOOTH_ALPHA)
 
-    # rewind
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
     model = YOLO(YOLO_WEIGHTS)
@@ -374,7 +389,6 @@ def main():
     last_t = time.time()
 
     while True:
-        t0 = time.time()
         ret, frame = cap.read()
         if not ret:
             break
@@ -395,7 +409,6 @@ def main():
                 H = warp.H
                 warp_ok = warp.last_good
 
-            # fail nhiều thì chỉ reset counter (không rebase để khỏi jump)
             if warp.fail_count >= REBASE_FAILS:
                 warp.fail_count = 0
 
@@ -411,8 +424,8 @@ def main():
         # draw lanes
         cv2.polylines(out, [np.array(road_cur_px, np.int32).reshape(-1, 1, 2)], True, (255, 255, 0), 2)
         for lane in lanes_cur_px:
-            color = (255, 0, 0) if lane["type"] == "car" else (0, 255, 255)
-            cv2.polylines(out, [np.array(lane["poly"], np.int32).reshape(-1, 1, 2)], True, color, 2)
+            color_lane = (255, 0, 0) if lane["type"] == "car" else (0, 255, 255)
+            cv2.polylines(out, [np.array(lane["poly"], np.int32).reshape(-1, 1, 2)], True, color_lane, 2)
 
         # --- YOLO + ByteTrack
         t_y0 = time.time()
@@ -437,8 +450,8 @@ def main():
 
         for i in range(len(xyxy)):
             cls_id = int(cls[i])
-            cls_name = model.names.get(cls_id, str(cls_id))
-            cls_name = "motorcycle" if cls_name in ["motorbike", "motorcycle"] else cls_name
+            raw_name = model.names.get(cls_id, str(cls_id))
+            cls_name = norm_class_name(raw_name)
 
             tid = int(ids[i]) if ids is not None else (i + 1)
 
@@ -455,15 +468,24 @@ def main():
             if should_mask((x1, y1, x2, y2), img_h=Hh):
                 mask_plate(out, (x1, y1, x2, y2))
 
-            # draw bbox
-            color = (0, 0, 255) if is_viol else (0, 255, 0)
+            # draw bbox (motorcycle sẽ có màu riêng)
+            base_color = BASE_COLORS.get(cls_name, (0, 255, 0))
+            color = (0, 0, 255) if is_viol else base_color
+
             ix1, iy1, ix2, iy2 = int(x1), int(y1), int(x2), int(y2)
             ix1 = max(0, min(Ww - 1, ix1))
             iy1 = max(0, min(Hh - 1, iy1))
             ix2 = max(0, min(Ww - 1, ix2))
             iy2 = max(0, min(Hh - 1, iy2))
+
             if ix2 > ix1 and iy2 > iy1:
                 cv2.rectangle(out, (ix1, iy1), (ix2, iy2), color, 2)
+
+                if DRAW_LABELS:
+                    label = f"{cls_name}:{tid}"
+                    if lane_id is not None:
+                        label += f" L{lane_id}"
+                    draw_label(out, ix1, iy1, label, color)
 
             if SAVE_VIOLATIONS and is_viol:
                 with open(LOG_CSV, "a", newline="", encoding="utf-8") as f:
@@ -480,7 +502,7 @@ def main():
         inl = warp.last_inlier if (USE_WARP and warp is not None) else 0.0
         goodm = warp.last_good_matches if (USE_WARP and warp is not None) else 0
         cv2.putText(out,
-                    f"fps={fps_ema:.1f}  yolo={yolo_ms}ms  veh={len(xyxy)}  viol={violations}  detScale={WORK_SCALE} imgsz={IMGSZ}",
+                    f"fps={fps_ema:.1f}  yolo={yolo_ms}ms  veh={len(xyxy)}  viol={violations}  scale={WORK_SCALE} imgsz={IMGSZ}",
                     (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
         cv2.putText(out,
                     f"warp={'OK' if warp_ok else 'HOLD'}  inl={inl:.2f}  good={goodm}  every={WARP_UPDATE_EVERY}  nearMask={MASK_NEAR_ONLY}",
