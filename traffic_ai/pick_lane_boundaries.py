@@ -12,7 +12,7 @@ ROAD_POLY_NORM = [
     (0.3443, 0.4343),
 ]
 
-NUM_LANES = 3  # số lane bạn đang dùng
+NUM_LANES = 4  # số lane 
 
 points_clicked = []
 frame = None

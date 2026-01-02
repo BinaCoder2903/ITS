@@ -73,11 +73,11 @@ ROAD_POLY_NORM = [
 
 BOUNDARY_TS = [
     0.0000,
-    0.2158,
-    0.7302,
+    0.2194,
+    0.4742,
+    0.7374,
     1.0000,
 ]
-
 LANE_TYPES = ["car", "car", "car"]  # ví dụ: ["car","car","motorcycle"]
 
 # =========================
