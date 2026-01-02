@@ -8,7 +8,7 @@ from typing import List, Tuple, Dict, Optional
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-VIDEO_SOURCE = os.path.join(BASE_DIR, "data", "video", "test 1.mp4")
+VIDEO_SOURCE = os.path.join(BASE_DIR, "data", "video", "test 3.mp4")
 DISPLAY_SCALE = 0.6
 
 # Output

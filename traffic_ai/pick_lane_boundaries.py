@@ -3,13 +3,13 @@ import os
 import numpy as np
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-VIDEO_SOURCE = os.path.join(BASE_DIR, "data","video", "test 2.mp4")
+VIDEO_SOURCE = os.path.join(BASE_DIR, "data","video", "test 3.mp4")
 
 ROAD_POLY_NORM = [
-    (0.0719, 0.9454),
-    (0.5984, 0.9704),
-    (0.5927, 0.5370),
-    (0.4484, 0.5315),
+    (0.1224, 0.9111),
+    (0.9891, 0.9046),
+    (0.7052, 0.4157),
+    (0.3443, 0.4343),
 ]
 
 NUM_LANES = 3  # số lane bạn đang dùng

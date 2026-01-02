@@ -1,5 +1,1 @@
 frame,time_sec,track_id,class,conf,lane_id,lane_type,bbox_x1,bbox_y1,bbox_x2,bbox_y2,evidence_path
-1,0.03,1,car,0.761,1,motorbike,426,963,644,1077,D:/WorkSpace/ITS/traffic_ai/output/evidence/v_000000_id1_car_L1.jpg
-1,0.03,7,car,0.549,1,motorbike,636,725,787,893,D:/WorkSpace/ITS/traffic_ai/output/evidence/v_000000_id7_car_L1.jpg
-31,1.03,12,truck,0.494,1,motorbike,608,769,785,962,D:/WorkSpace/ITS/traffic_ai/output/evidence/v_000010_id12_truck_L1.jpg
-57,1.9,2,car,0.652,1,motorbike,739,645,853,762,D:/WorkSpace/ITS/traffic_ai/output/evidence/v_000019_id2_car_L1.jpg

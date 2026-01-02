@@ -7,55 +7,56 @@ import numpy as np
 from typing import List, Tuple, Dict, Optional
 
 # =========================
-# CONFIG
+# CONFIG (tune ở đây)
 # =========================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-VIDEO_SOURCE = os.path.join(BASE_DIR, "data", "video", "test 2.mp4")
+VIDEO_SOURCE = os.path.join(BASE_DIR, "data", "video", "test 3.mp4")  # hoặc 0 nếu webcam
 YOLO_WEIGHTS = "yolov8n.pt"
 TRACKER_CFG = "bytetrack.yaml"
 
 # Speed
-WORK_SCALE = 0.85
-DISPLAY_SCALE = 0.85
-IMGSZ = 480
+WORK_SCALE = 0.85          # scale xử lý (warp + yolo + draw). 0.75~1.0
+DISPLAY_SCALE = 0.85       # scale hiển thị
+IMGSZ = 384                # 480->416->384 nếu lag
 CONF_TH = 0.35
-MAX_DET = 60
+MAX_DET = 30
 TARGET_CLASS_IDS = [2, 3, 5, 7]  # car, motorcycle, bus, truck (COCO)
 
-# Smooth bbox
-SMOOTH_ALPHA = 0.65
+# Smoothing bbox (EMA)
+SMOOTH_ALPHA = 0.65        # 0..1
 
-# Warp stabilize
+# Warp chống lệch lane do zoom / rung
 USE_WARP = True
-WARP_UPDATE_EVERY = 10
-ROI_YMAX = 0.65                 # lấy feature ở phần trên
-SIDE_MARGIN_NORM = 0.16         # ưu tiên lề trái/phải
-MIN_GOOD_MATCHES = 80
+WARP_UPDATE_EVERY = 30     # 10->30/45 để hết khựng theo chu kỳ
+WARP_SCALE = 0.55          # warp chạy trên ảnh nhỏ (0.5~0.65)
+ROI_YMAX = 0.60            # lấy feature phía trên (tránh xe làm nhiễu)
+
+MIN_GOOD_MATCHES = 50
 MIN_INLIER_RATIO = 0.25
 RANSAC_REPROJ = 4.0
 REBASE_FAILS = 25
 
-# Deadband + smoothing cho warp (giảm drift khi cam đứng yên)
-DEAD_TRANS_PX = 1.2             # tịnh tiến nhỏ hơn ngưỡng => coi như 0
-DEAD_SCALE = 0.004              # |scale-1| nhỏ => coi như 0
-H_SMOOTH_GAMMA = 0.20           # 0..1, nhỏ hơn = mượt hơn nhưng trễ hơn
-
 # Mask biển số
 MASK_PLATE = True
-MASK_MODE = "fill"              # "fill" nhanh; "blur" nặng hơn
-
+MASK_MODE = "fill"         # "fill" nhanh nhất; "blur" nặng hơn
 MASK_NEAR_ONLY = True
-MASK_NEAR_Y2_NORM = 0.72        # chỉ mask nếu đáy bbox nằm dưới 72% chiều cao
-MASK_NEAR_MIN_H = 120           # hoặc bbox cao >= 120px
+MASK_NEAR_Y2_NORM = 0.72   # chỉ mask nếu đáy bbox nằm dưới 72% chiều cao ảnh
+MASK_NEAR_MIN_H = 120      # hoặc bbox cao >= 120px
 
 # Output log
 SAVE_VIOLATIONS = True
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 LOG_CSV = os.path.join(OUTPUT_DIR, "violations_log.csv")
 
+# OpenCV / torch threads (giảm giật)
 try:
     cv2.setNumThreads(1)
+except Exception:
+    pass
+try:
+    import torch
+    torch.set_num_threads(1)
 except Exception:
     pass
 
@@ -64,23 +65,23 @@ except Exception:
 # order: left_bottom, right_bottom, right_top, left_top
 # =========================
 ROAD_POLY_NORM = [
-    (0.0719, 0.9454),
-    (0.5984, 0.9704),
-    (0.5927, 0.5370),
-    (0.4484, 0.5315),
+    (0.2333, 0.8870),
+    (0.9891, 0.9000),
+    (0.7078, 0.4231),
+    (0.3906, 0.4278),
 ]
-
 
 BOUNDARY_TS = [
     0.0000,
-    0.2613,
-    0.6295,
+    0.2158,
+    0.7302,
     1.0000,
 ]
+
 LANE_TYPES = ["car", "car", "car"]  # ví dụ: ["car","car","motorcycle"]
 
 # =========================
-# Geometry
+# Helpers (geometry)
 # =========================
 def lerp(p1, p2, t: float):
     return (p1[0] + (p2[0] - p1[0]) * t, p1[1] + (p2[1] - p1[1]) * t)
@@ -125,6 +126,7 @@ def build_allowed_lanes(lanes_cfg):
 
     car_lanes = set(lanes_by_type.get("car", []))
     moto_lanes = set(lanes_by_type.get("motorcycle", []))
+
     return {
         "car": car_lanes,
         "bus": car_lanes,
@@ -151,7 +153,7 @@ def assign_lane_bottom_center(bbox, lanes_px) -> Optional[int]:
     return None
 
 # =========================
-# Mask plate (near-only)
+# Plate mask (near only)
 # =========================
 def should_mask(bbox_xyxy, img_h: int) -> bool:
     if not MASK_PLATE:
@@ -160,22 +162,22 @@ def should_mask(bbox_xyxy, img_h: int) -> bool:
     bh = max(0.0, y2 - y1)
     if not MASK_NEAR_ONLY:
         return True
-    near_by_y = (y2 >= img_h * MASK_NEAR_Y2_NORM)
-    near_by_size = (bh >= MASK_NEAR_MIN_H)
-    return bool(near_by_y or near_by_size)
+    return (y2 >= img_h * MASK_NEAR_Y2_NORM) or (bh >= MASK_NEAR_MIN_H)
 
 def mask_plate(img, bbox):
     x1, y1, x2, y2 = bbox
     x1 = int(max(0, x1)); y1 = int(max(0, y1))
-    x2 = int(min(img.shape[1]-1, x2)); y2 = int(min(img.shape[0]-1, y2))
+    x2 = int(min(img.shape[1] - 1, x2)); y2 = int(min(img.shape[0] - 1, y2))
     if x2 <= x1 or y2 <= y1:
         return
 
     bw = max(1, x2 - x1)
     bh = max(1, y2 - y1)
-    if bh < 80:
+
+    if bh < 80:  # xe rất xa -> khỏi mask
         return
 
+    # vùng biển số (nhỏ hơn để khỏi “khối đen to”)
     px1 = int(x1 + 0.28 * bw)
     px2 = int(x1 + 0.72 * bw)
     py1 = int(y1 + 0.72 * bh)
@@ -193,133 +195,114 @@ def mask_plate(img, bbox):
         cv2.rectangle(img, (px1, py1), (px2, py2), (0, 0, 0), -1)
 
 # =========================
-# Warp (AKAZE + RANSAC) + static mask + deadband + smoothing
+# Warp: Reference -> Current (Homography)
 # =========================
-def affine_to_H(A2x3: np.ndarray) -> np.ndarray:
-    H = np.eye(3, dtype=np.float32)
-    H[:2, :] = A2x3.astype(np.float32)
-    return H
+class ReferenceHomographyWarp:
+    def __init__(self, ref_frame_bgr, road_poly_px, roi_ymax=0.60, warp_scale=0.60,
+                 min_good=60, min_inlier=0.25, ransac_reproj=4.0, smooth_gamma=0.35):
+        self.warp_scale = float(warp_scale)
+        self.min_good = int(min_good)
+        self.min_inlier = float(min_inlier)
+        self.ransac_reproj = float(ransac_reproj)
+        self.smooth_gamma = float(smooth_gamma)
 
-def H_to_affine(H: np.ndarray) -> np.ndarray:
-    return H[:2, :].astype(np.float32)
-
-def affine_scale(A2x3: np.ndarray) -> float:
-    a, b, _ = A2x3[0]
-    c, d, _ = A2x3[1]
-    s1 = np.sqrt(a*a + b*b)
-    s2 = np.sqrt(c*c + d*d)
-    return float((s1 + s2) * 0.5)
-
-def affine_trans(A2x3: np.ndarray) -> float:
-    tx = float(A2x3[0, 2])
-    ty = float(A2x3[1, 2])
-    return float(np.sqrt(tx*tx + ty*ty))
-
-class IncrementalAffineWarp:
-    def __init__(self, ref_frame_bgr, road_poly_px: List[Tuple[int, int]]):
         self.det = cv2.AKAZE_create()
         self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
-
-        self.H_total = np.eye(3, dtype=np.float32)
-        self.A_total = np.eye(2, 3, dtype=np.float32)
-
-        self.prev_gray = cv2.cvtColor(ref_frame_bgr, cv2.COLOR_BGR2GRAY)
-        h, w = self.prev_gray.shape[:2]
-
-        # mask: ưu tiên TOP + hai lề; loại vùng mặt đường để tránh xe
-        mask = np.zeros((h, w), dtype=np.uint8)
-
-        top_h = int(h * ROI_YMAX)
-        cv2.rectangle(mask, (0, 0), (w, top_h), 255, -1)
-
-        side = int(w * SIDE_MARGIN_NORM)
-        cv2.rectangle(mask, (0, 0), (side, h), 255, -1)
-        cv2.rectangle(mask, (w - side, 0), (w, h), 255, -1)
-
-        # loại road polygon (mặt đường/xe chạy) khỏi mask
-        road_cnt = np.array(road_poly_px, dtype=np.int32).reshape(-1, 1, 2)
-        cv2.fillPoly(mask, [road_cnt], 0)
-
-        self.mask = mask
-
-        self.prev_kp, self.prev_des = self.det.detectAndCompute(self.prev_gray, self.mask)
 
         self.fail_count = 0
         self.last_good = True
         self.last_inlier = 0.0
         self.last_good_matches = 0
-        self.last_scale = 1.0
-        self.last_trans = 0.0
+
+        ref_gray_full = cv2.cvtColor(ref_frame_bgr, cv2.COLOR_BGR2GRAY)
+        h, w = ref_gray_full.shape[:2]
+
+        # mask: lấy phần trên + bỏ vùng road (xe chạy)
+        mask_full = np.zeros((h, w), dtype=np.uint8)
+        cv2.rectangle(mask_full, (0, 0), (w, int(h * roi_ymax)), 255, -1)
+        road_cnt = np.array(road_poly_px, dtype=np.int32).reshape(-1, 1, 2)
+        cv2.fillPoly(mask_full, [road_cnt], 0)
+
+        if self.warp_scale != 1.0:
+            self.ref_gray = cv2.resize(ref_gray_full, None, fx=self.warp_scale, fy=self.warp_scale,
+                                       interpolation=cv2.INTER_AREA)
+            self.mask = cv2.resize(mask_full, (self.ref_gray.shape[1], self.ref_gray.shape[0]),
+                                   interpolation=cv2.INTER_NEAREST)
+        else:
+            self.ref_gray = ref_gray_full
+            self.mask = mask_full
+
+        self.ref_kp, self.ref_des = self.det.detectAndCompute(self.ref_gray, self.mask)
+        self.H = np.eye(3, dtype=np.float32)
 
     def update(self, frame_bgr):
-        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-        kp, des = self.det.detectAndCompute(gray, self.mask)
+        gray_full = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        if self.warp_scale != 1.0:
+            gray = cv2.resize(gray_full, None, fx=self.warp_scale, fy=self.warp_scale,
+                              interpolation=cv2.INTER_AREA)
+        else:
+            gray = gray_full
 
-        if des is None or self.prev_des is None or len(kp) < 80 or len(self.prev_kp) < 80:
+        kp, des = self.det.detectAndCompute(gray, self.mask)
+        if des is None or self.ref_des is None or len(kp) < 60 or len(self.ref_kp) < 60:
             self.fail_count += 1
             self.last_good = False
-            return self.H_total, False
+            return self.H, False
 
-        matches = self.matcher.knnMatch(self.prev_des, des, k=2)
+        matches = self.matcher.knnMatch(self.ref_des, des, k=2)
         good = []
         for m, n in matches:
             if m.distance < 0.75 * n.distance:
                 good.append(m)
 
         self.last_good_matches = len(good)
-        if len(good) < MIN_GOOD_MATCHES:
+        if len(good) < self.min_good:
             self.fail_count += 1
             self.last_good = False
-            return self.H_total, False
+            return self.H, False
 
-        src = np.float32([self.prev_kp[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+        src = np.float32([self.ref_kp[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
         dst = np.float32([kp[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
 
-        A, inliers = cv2.estimateAffinePartial2D(
-            src, dst, method=cv2.RANSAC,
-            ransacReprojThreshold=RANSAC_REPROJ,
-            maxIters=1500, confidence=0.99
-        )
-        if A is None or inliers is None:
+        H_new, inliers = cv2.findHomography(src, dst, cv2.RANSAC, self.ransac_reproj)
+        if H_new is None or inliers is None:
             self.fail_count += 1
             self.last_good = False
-            return self.H_total, False
+            return self.H, False
 
         inlier_ratio = float(inliers.mean())
         self.last_inlier = inlier_ratio
-        if inlier_ratio < MIN_INLIER_RATIO:
+        if inlier_ratio < self.min_inlier:
             self.fail_count += 1
             self.last_good = False
-            return self.H_total, False
+            return self.H, False
 
-        A = A.astype(np.float32)
-        sc = affine_scale(A)
-        tr = affine_trans(A)
-        self.last_scale = sc
-        self.last_trans = tr
+        H_new = H_new.astype(np.float32)
 
-        # DEAD-BAND: camera gần như đứng yên => bỏ update để khỏi drift
-        if (tr < DEAD_TRANS_PX) and (abs(sc - 1.0) < DEAD_SCALE):
-            # vẫn cập nhật prev để match ổn định, nhưng giữ H_total
-            self.prev_gray = gray
-            self.prev_kp, self.prev_des = kp, des
-            self.fail_count = 0
-            self.last_good = True
-            return self.H_total, True
+        # convert scaled-H -> full-res H
+        if self.warp_scale != 1.0:
+            s = self.warp_scale
+            S = np.array([[s, 0, 0],
+                          [0, s, 0],
+                          [0, 0, 1]], dtype=np.float32)
+            Sinv = np.array([[1/s, 0, 0],
+                             [0, 1/s, 0],
+                             [0, 0, 1]], dtype=np.float32)
+            H_new = Sinv @ H_new @ S
 
-        # update tổng + smooth
-        A_new = (A @ np.vstack([self.A_total, [0, 0, 1]]))[:2, :]  # compose (affine)
-        self.A_total = (1.0 - H_SMOOTH_GAMMA) * self.A_total + H_SMOOTH_GAMMA * A_new
-        self.H_total = affine_to_H(self.A_total)
+        # smooth
+        H_new = H_new / (H_new[2, 2] + 1e-8)
+        H_old = self.H / (self.H[2, 2] + 1e-8)
+        H_blend = (1.0 - self.smooth_gamma) * H_old + self.smooth_gamma * H_new
+        H_blend = H_blend / (H_blend[2, 2] + 1e-8)
 
-        self.prev_gray = gray
-        self.prev_kp, self.prev_des = kp, des
+        self.H = H_blend
         self.fail_count = 0
         self.last_good = True
-        return self.H_total, True
+        return self.H, True
 
 # =========================
-# EMA smoother for bbox
+# EMA bbox smoother
 # =========================
 class BoxSmoother:
     def __init__(self, alpha=0.65):
@@ -357,25 +340,38 @@ def main():
         print("[ERROR] Cannot read first frame")
         return
 
+    # scale working frame
     if WORK_SCALE != 1.0:
         f0 = cv2.resize(f0, None, fx=WORK_SCALE, fy=WORK_SCALE, interpolation=cv2.INTER_AREA)
 
     Hh, Ww = f0.shape[:2]
+
     road_ref_px = denorm_polygon(ROAD_POLY_NORM, Ww, Hh)
     lanes_ref_px = generate_lane_polys_pixel(road_ref_px, BOUNDARY_TS, LANE_TYPES)
     allowed_lanes_by_cls = build_allowed_lanes(lanes_ref_px)
 
-    warp = IncrementalAffineWarp(f0, road_ref_px) if USE_WARP else None
+    warp = ReferenceHomographyWarp(
+        f0,
+        road_ref_px,
+        roi_ymax=ROI_YMAX,
+        warp_scale=WARP_SCALE,
+        min_good=MIN_GOOD_MATCHES,
+        min_inlier=MIN_INLIER_RATIO,
+        ransac_reproj=RANSAC_REPROJ,
+        smooth_gamma=0.35,
+    ) if USE_WARP else None
+
     smoother = BoxSmoother(alpha=SMOOTH_ALPHA)
 
+    # rewind
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
     model = YOLO(YOLO_WEIGHTS)
     cv2.namedWindow("ITS Stream", cv2.WINDOW_NORMAL)
 
     frame_idx = 0
-    fps = 0.0
-    fps_t = time.time()
+    fps_ema = 0.0
+    last_t = time.time()
 
     while True:
         t0 = time.time()
@@ -389,24 +385,21 @@ def main():
         frame_idx += 1
         out = frame.copy()
 
-        # Warp update thưa
+        # --- Warp update thưa để tránh khựng
         H = np.eye(3, dtype=np.float32)
         warp_ok = True
         if USE_WARP and warp is not None:
             if (frame_idx % WARP_UPDATE_EVERY) == 0:
                 H, warp_ok = warp.update(frame)
             else:
-                H = warp.H_total
+                H = warp.H
                 warp_ok = warp.last_good
 
+            # fail nhiều thì chỉ reset counter (không rebase để khỏi jump)
             if warp.fail_count >= REBASE_FAILS:
-                # rebase lại theo frame hiện tại để tránh drift dài hạn
-                road_ref_px = warp_points(road_ref_px, H)
-                lanes_ref_px = generate_lane_polys_pixel(road_ref_px, BOUNDARY_TS, LANE_TYPES)
-                allowed_lanes_by_cls = build_allowed_lanes(lanes_ref_px)
-                warp = IncrementalAffineWarp(frame, road_ref_px)
-                H = np.eye(3, dtype=np.float32)
+                warp.fail_count = 0
 
+        # warp road + lanes
         road_cur_px = warp_points(road_ref_px, H)
         lanes_cur_px = [{
             "id": ln["id"],
@@ -415,12 +408,14 @@ def main():
             "poly": warp_points(ln["poly"], H),
         } for ln in lanes_ref_px]
 
+        # draw lanes
         cv2.polylines(out, [np.array(road_cur_px, np.int32).reshape(-1, 1, 2)], True, (255, 255, 0), 2)
         for lane in lanes_cur_px:
             color = (255, 0, 0) if lane["type"] == "car" else (0, 255, 255)
             cv2.polylines(out, [np.array(lane["poly"], np.int32).reshape(-1, 1, 2)], True, color, 2)
 
-        # YOLO + ByteTrack
+        # --- YOLO + ByteTrack
+        t_y0 = time.time()
         res = model.track(
             frame,
             persist=True,
@@ -431,6 +426,7 @@ def main():
             max_det=MAX_DET,
             verbose=False
         )[0]
+        yolo_ms = int((time.time() - t_y0) * 1000)
 
         boxes = res.boxes
         ids = None if boxes.id is None else boxes.id.cpu().numpy().astype(int)
@@ -442,8 +438,7 @@ def main():
         for i in range(len(xyxy)):
             cls_id = int(cls[i])
             cls_name = model.names.get(cls_id, str(cls_id))
-            if cls_name in ["motorbike", "motorcycle"]:
-                cls_name = "motorcycle"
+            cls_name = "motorcycle" if cls_name in ["motorbike", "motorcycle"] else cls_name
 
             tid = int(ids[i]) if ids is not None else (i + 1)
 
@@ -456,9 +451,11 @@ def main():
             if is_viol:
                 violations += 1
 
+            # mask near only
             if should_mask((x1, y1, x2, y2), img_h=Hh):
                 mask_plate(out, (x1, y1, x2, y2))
 
+            # draw bbox
             color = (0, 0, 255) if is_viol else (0, 255, 0)
             ix1, iy1, ix2, iy2 = int(x1), int(y1), int(x2), int(y2)
             ix1 = max(0, min(Ww - 1, ix1))
@@ -473,24 +470,23 @@ def main():
                     w = csv.writer(f)
                     w.writerow([time.time(), frame_idx, tid, cls_name, lane_id, "VIOLATION"])
 
+        # --- FPS EMA
         now = time.time()
-        dt = max(1e-6, now - t0)
-        if now - fps_t >= 0.4:
-            fps = 1.0 / dt
-            fps_t = now
+        dt = max(1e-6, now - last_t)
+        inst_fps = 1.0 / dt
+        fps_ema = inst_fps if fps_ema <= 0 else (0.15 * inst_fps + 0.85 * fps_ema)
+        last_t = now
 
         inl = warp.last_inlier if (USE_WARP and warp is not None) else 0.0
         goodm = warp.last_good_matches if (USE_WARP and warp is not None) else 0
-        sc = warp.last_scale if (USE_WARP and warp is not None) else 1.0
-        tr = warp.last_trans if (USE_WARP and warp is not None) else 0.0
-
         cv2.putText(out,
-                    f"fps={fps:.1f} veh={len(xyxy)} viol={violations} detScale={WORK_SCALE} imgsz={IMGSZ}",
+                    f"fps={fps_ema:.1f}  yolo={yolo_ms}ms  veh={len(xyxy)}  viol={violations}  detScale={WORK_SCALE} imgsz={IMGSZ}",
                     (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
         cv2.putText(out,
-                    f"warp={'OK' if warp_ok else 'HOLD'} inl={inl:.2f} good={goodm} every={WARP_UPDATE_EVERY} s={sc:.3f} t={tr:.1f} nearMask={MASK_NEAR_ONLY}",
+                    f"warp={'OK' if warp_ok else 'HOLD'}  inl={inl:.2f}  good={goodm}  every={WARP_UPDATE_EVERY}  nearMask={MASK_NEAR_ONLY}",
                     (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
 
+        # --- display
         disp = out
         if DISPLAY_SCALE != 1.0:
             disp = cv2.resize(out, None, fx=DISPLAY_SCALE, fy=DISPLAY_SCALE, interpolation=cv2.INTER_LINEAR)
