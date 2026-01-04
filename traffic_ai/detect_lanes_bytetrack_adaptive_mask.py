@@ -1,66 +1,57 @@
 from ultralytics import YOLO
-import cv2
-import os
-import time
-import csv
+import cv2, os, time, csv
 import numpy as np
 from typing import List, Tuple, Dict, Optional
 
-# =========================
-# CONFIG
-# =========================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-VIDEO_SOURCE = os.path.join(BASE_DIR, "data", "video", "test 3.mp4")  # hoặc 0 nếu webcam
+VIDEO_SOURCE = os.path.join(BASE_DIR, "data", "video", "test 3.mp4")
 YOLO_WEIGHTS = "yolov8n.pt"
 TRACKER_CFG = "bytetrack.yaml"
 
 WORK_SCALE = 0.85
 DISPLAY_SCALE = 0.85
 
-IMGSZ = 512          # 640 -> 512 (mượt hơn), nếu vẫn lag: 480/416
-MAX_DET = 160        # xe máy đông thì để 140~200
-CONF_TRACK = 0.08    # để thấp để ít lọt; sẽ lọc lại theo từng lớp ở dưới
+IMGSZ = 512
+MAX_DET = 300
+CONF_TRACK = 0.05
+TARGET_CLASS_IDS = [2, 3, 5, 7]  # car, motorcycle, bus, truck
 
-# COCO: car=2, motorcycle=3, bus=5, truck=7
-TARGET_CLASS_IDS = [2, 3, 5, 7]
-
-# lọc lại theo lớp (giảm lọt, vẫn bắt xe máy)
-CAR_MIN_CONF = 0.22
-MOTO_MIN_CONF = 0.12
-BUS_MIN_CONF = 0.25
-TRUCK_MIN_CONF = 0.25
+CAR_MIN_CONF = 0.20
+MOTO_MIN_CONF = 0.08
+BUS_MIN_CONF = 0.22
+TRUCK_MIN_CONF = 0.22
 
 SMOOTH_ALPHA = 0.65
 
 USE_WARP = True
-WARP_UPDATE_EVERY = 60     # tăng để hết khựng: 60~90
-WARP_SCALE = 0.50          # warp chạy trên ảnh nhỏ
-ROI_YMAX = 0.60            # chỉ lấy feature phía trên
+WARP_UPDATE_EVERY = 60
+WARP_SCALE = 0.50
+ROI_YMAX = 0.60
 MIN_GOOD_MATCHES = 45
 MIN_INLIER_RATIO = 0.25
 RANSAC_REPROJ = 4.0
 SMOOTH_GAMMA = 0.35
-
 DEAD_TRANS_PX = 2.0
 DEAD_SCALE = 0.002
 
-# Mask plate: CHỈ xe 4 bánh (car/bus/truck), KHÔNG mask xe máy
 MASK_PLATE = True
-MASK_MODE = "fill"         # fill nhanh nhất
+MASK_MODE = "fill"
 MASK_NEAR_ONLY = True
 MASK_NEAR_Y2_NORM = 0.72
 MASK_NEAR_MIN_H = 120
 
-# Vẽ chữ tối ưu
 DRAW_LABELS = True
 DRAW_LABEL_ONLY_VIOL = True
-DRAW_MOTO_LABELS = False   # xe máy chỉ box cho mượt
+DRAW_MOTO_LABELS = False
 
-# Log
 SAVE_VIOLATIONS = True
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 LOG_CSV = os.path.join(OUTPUT_DIR, "violations_log.csv")
+
+# --- Detect trên ROI mặt đường để giảm lọt xe máy
+DETECT_ROI = True
+ROI_PAD_X = 0.06  # nới bbox theo % width
+ROI_PAD_Y = 0.10  # nới bbox theo % height
 
 try:
     cv2.setNumThreads(1)
@@ -72,10 +63,7 @@ try:
 except Exception:
     pass
 
-# =========================
-# ROAD / LANES
 # order: left_bottom, right_bottom, right_top, left_top
-# =========================
 ROAD_POLY_NORM = [
     (0.1224, 0.9111),
     (0.9891, 0.9046),
@@ -83,26 +71,14 @@ ROAD_POLY_NORM = [
     (0.3443, 0.4343),
 ]
 
-BOUNDARY_TS = [
-    0.0000,
-    0.2194,
-    0.4742,
-    0.7374,
-    1.0000,
-]
+BOUNDARY_TS = [0.0000, 0.2194, 0.4742, 0.7374, 1.0000]
+LANE_TYPES = ["car", "car", "car", "car"]  # đổi lane xe máy nếu muốn: ["motorcycle","car","car","car"]
 
-# lane type để quyết định lane nào cho xe máy (nếu muốn)
-# ví dụ lane 1 là xe máy: ["motorcycle","car","car","car"]
-LANE_TYPES = ["car", "car", "car", "car"]
-
-# =========================
-# Helpers
-# =========================
 def lerp(p1, p2, t: float):
-    return (p1[0] + (p2[0] - p1[0]) * t, p1[1] + (p2[1] - p1[1]) * t)
+    return (p1[0] + (p2[0]-p1[0])*t, p1[1] + (p2[1]-p1[1])*t)
 
 def denorm_polygon(poly_norm, w: int, h: int):
-    return [(int(x * w), int(y * h)) for x, y in poly_norm]
+    return [(int(x*w), int(y*h)) for x, y in poly_norm]
 
 def generate_lane_polys_pixel(road_poly_px: List[Tuple[int, int]],
                               boundary_ts: List[float],
@@ -110,21 +86,19 @@ def generate_lane_polys_pixel(road_poly_px: List[Tuple[int, int]],
     lb, rb, rt, lt = road_poly_px
     ts = sorted([max(0.0, min(1.0, float(t))) for t in boundary_ts])
     n = len(ts) - 1
-    if n < 1:
-        raise ValueError("BOUNDARY_TS phải có ít nhất 2 giá trị.")
     if len(lane_types) < n:
-        lane_types = lane_types + ["car"] * (n - len(lane_types))
+        lane_types = lane_types + ["car"]*(n-len(lane_types))
     lane_types = lane_types[:n]
 
     lanes = []
     for i in range(n):
-        tL, tR = ts[i], ts[i + 1]
+        tL, tR = ts[i], ts[i+1]
         bL = lerp(lb, rb, tL)
         bR = lerp(lb, rb, tR)
         tR_pt = lerp(lt, rt, tR)
         tL_pt = lerp(lt, rt, tL)
         lanes.append({
-            "id": i + 1,
+            "id": i+1,
             "name": f"L{i+1}",
             "type": lane_types[i].replace("motorbike", "motorcycle"),
             "poly": [(int(bL[0]), int(bL[1])),
@@ -138,10 +112,8 @@ def build_allowed_lanes(lanes_cfg):
     lanes_by_type: Dict[str, List[int]] = {}
     for lane in lanes_cfg:
         lanes_by_type.setdefault(lane["type"], []).append(lane["id"])
-
     car_lanes = set(lanes_by_type.get("car", []))
     moto_lanes = set(lanes_by_type.get("motorcycle", []))
-
     return {
         "car": car_lanes,
         "bus": car_lanes,
@@ -174,18 +146,13 @@ def class_min_conf(cls_name: str) -> float:
     if cls_name == "truck": return TRUCK_MIN_CONF
     return 0.0
 
-# =========================
-# Mask plate (4 bánh, near only)
-# =========================
 def should_mask(bbox_xyxy, img_h: int, cls_name: str) -> bool:
     if not MASK_PLATE:
         return False
     if cls_name == "motorcycle":
         return False
-
     x1, y1, x2, y2 = bbox_xyxy
     bh = max(0.0, y2 - y1)
-
     if not MASK_NEAR_ONLY:
         return True
     return (y2 >= img_h * MASK_NEAR_Y2_NORM) or (bh >= MASK_NEAR_MIN_H)
@@ -193,48 +160,38 @@ def should_mask(bbox_xyxy, img_h: int, cls_name: str) -> bool:
 def mask_plate(img, bbox):
     x1, y1, x2, y2 = bbox
     x1 = int(max(0, x1)); y1 = int(max(0, y1))
-    x2 = int(min(img.shape[1] - 1, x2)); y2 = int(min(img.shape[0] - 1, y2))
+    x2 = int(min(img.shape[1]-1, x2)); y2 = int(min(img.shape[0]-1, y2))
     if x2 <= x1 or y2 <= y1:
         return
-
     bw = max(1, x2 - x1)
     bh = max(1, y2 - y1)
     if bh < 80:
         return
-
     px1 = int(x1 + 0.28 * bw)
     px2 = int(x1 + 0.72 * bw)
     py1 = int(y1 + 0.72 * bh)
     py2 = int(y2 - 0.08 * bh)
-
     px1 = max(0, px1); py1 = max(0, py1)
     px2 = min(img.shape[1], px2); py2 = min(img.shape[0], py2)
     if px2 <= px1 or py2 <= py1:
         return
-
     if MASK_MODE == "blur":
         roi = img[py1:py2, px1:px2]
         img[py1:py2, px1:px2] = cv2.GaussianBlur(roi, (0, 0), sigmaX=14)
     else:
         cv2.rectangle(img, (px1, py1), (px2, py2), (0, 0, 0), -1)
 
-# =========================
-# Warp: reference -> current (homography)
-# =========================
-def homography_motion_stats(H: np.ndarray, w: int, h: int) -> Tuple[float, float]:
+def homography_motion_stats(H: np.ndarray, w: int, h: int):
     Hn = H / (H[2, 2] + 1e-8)
     c = np.array([[w * 0.5, h * 0.5, 1.0]], dtype=np.float32).T
     p = np.array([[w * 0.5 + 120.0, h * 0.5, 1.0]], dtype=np.float32).T
-
     c2 = Hn @ c
     p2 = Hn @ p
     c2 = (c2[:2] / (c2[2] + 1e-8)).reshape(2)
     p2 = (p2[:2] / (p2[2] + 1e-8)).reshape(2)
-
     trans = float(np.linalg.norm(c2 - np.array([w * 0.5, h * 0.5], dtype=np.float32)))
-    dist0 = 120.0
     dist1 = float(np.linalg.norm(p2 - c2))
-    scale = dist1 / max(1e-6, dist0)
+    scale = dist1 / 120.0
     return trans, scale
 
 class ReferenceHomographyWarp:
@@ -320,12 +277,8 @@ class ReferenceHomographyWarp:
 
         if self.warp_scale != 1.0:
             s = self.warp_scale
-            S = np.array([[s, 0, 0],
-                          [0, s, 0],
-                          [0, 0, 1]], dtype=np.float32)
-            Sinv = np.array([[1/s, 0, 0],
-                             [0, 1/s, 0],
-                             [0, 0, 1]], dtype=np.float32)
+            S = np.array([[s, 0, 0],[0, s, 0],[0, 0, 1]], dtype=np.float32)
+            Sinv = np.array([[1/s, 0, 0],[0, 1/s, 0],[0, 0, 1]], dtype=np.float32)
             H_new = Sinv @ H_new @ S
 
         H_new = H_new / (H_new[2, 2] + 1e-8)
@@ -345,9 +298,6 @@ class ReferenceHomographyWarp:
         self.last_good = True
         return self.H, True
 
-# =========================
-# EMA bbox smoother
-# =========================
 class BoxSmoother:
     def __init__(self, alpha=0.65):
         self.alpha = float(max(0.0, min(1.0, alpha)))
@@ -363,9 +313,19 @@ class BoxSmoother:
         self.state[track_id] = sm
         return sm
 
-# =========================
-# MAIN
-# =========================
+def roi_from_poly(poly_px, w, h, pad_x=0.06, pad_y=0.10):
+    xs = [p[0] for p in poly_px]
+    ys = [p[1] for p in poly_px]
+    x1, x2 = max(0, min(xs)), min(w-1, max(xs))
+    y1, y2 = max(0, min(ys)), min(h-1, max(ys))
+    dx = int((x2 - x1) * pad_x)
+    dy = int((y2 - y1) * pad_y)
+    x1 = max(0, x1 - dx); x2 = min(w-1, x2 + dx)
+    y1 = max(0, y1 - dy); y2 = min(h-1, y2 + dy)
+    if x2 <= x1 or y2 <= y1:
+        return 0, 0, w, h
+    return x1, y1, x2, y2
+
 def main():
     log_f = None
     log_w = None
@@ -391,7 +351,6 @@ def main():
         f0 = cv2.resize(f0, None, fx=WORK_SCALE, fy=WORK_SCALE, interpolation=cv2.INTER_AREA)
 
     Hh, Ww = f0.shape[:2]
-
     road_ref_px = denorm_polygon(ROAD_POLY_NORM, Ww, Hh)
     lanes_ref_px = generate_lane_polys_pixel(road_ref_px, BOUNDARY_TS, LANE_TYPES)
     allowed_lanes_by_cls = build_allowed_lanes(lanes_ref_px)
@@ -441,8 +400,6 @@ def main():
             else:
                 H = warp.H
                 warp_ok = warp.last_good
-        else:
-            warp_ok = True
 
         road_cur_px = warp_points(road_ref_px, H)
         lanes_cur_px = [{
@@ -454,12 +411,21 @@ def main():
 
         cv2.polylines(out, [np.array(road_cur_px, np.int32).reshape(-1, 1, 2)], True, (255, 255, 0), 2)
         for lane in lanes_cur_px:
-            color_lane = (255, 0, 0) if lane["type"] == "car" else (0, 255, 255)
-            cv2.polylines(out, [np.array(lane["poly"], np.int32).reshape(-1, 1, 2)], True, color_lane, 2)
+            lane_color = (255, 0, 0) if lane["type"] == "car" else (0, 255, 255)
+            cv2.polylines(out, [np.array(lane["poly"], np.int32).reshape(-1, 1, 2)], True, lane_color, 2)
+
+        # --- ROI crop detect
+        if DETECT_ROI:
+            rx1, ry1, rx2, ry2 = roi_from_poly(road_cur_px, Ww, Hh, ROI_PAD_X, ROI_PAD_Y)
+            det_img = frame[ry1:ry2, rx1:rx2]
+            offx, offy = rx1, ry1
+        else:
+            det_img = frame
+            offx, offy = 0, 0
 
         t_y0 = time.time()
         res = model.track(
-            frame,
+            det_img,
             persist=True,
             tracker=TRACKER_CFG,
             conf=CONF_TRACK,
@@ -498,7 +464,12 @@ def main():
             kept += 1
             tid = int(ids[i]) if ids is not None else (i + 1)
 
-            bbox_sm = smoother.update(tid, xyxy[i])
+            # offset ROI -> full
+            x1, y1, x2, y2 = xyxy[i]
+            x1 += offx; x2 += offx
+            y1 += offy; y2 += offy
+
+            bbox_sm = smoother.update(tid, np.array([x1, y1, x2, y2], dtype=np.float32))
             x1, y1, x2, y2 = [float(v) for v in bbox_sm]
 
             lane_id = assign_lane_bottom_center((x1, y1, x2, y2), lanes_cur_px)
@@ -516,14 +487,15 @@ def main():
             iy1 = max(0, min(Hh - 1, iy1))
             ix2 = max(0, min(Ww - 1, ix2))
             iy2 = max(0, min(Hh - 1, iy2))
+
             if ix2 > ix1 and iy2 > iy1:
                 cv2.rectangle(out, (ix1, iy1), (ix2, iy2), color, 2)
 
                 if DRAW_LABELS:
                     if (not DRAW_LABEL_ONLY_VIOL) or is_viol:
                         if (cls_name != "motorcycle") or DRAW_MOTO_LABELS:
-                            lane_txt = f" L{lane_id}" if lane_id is not None else ""
-                            cv2.putText(out, f"{cls_name}:{tid}{lane_txt}",
+                            lt = f" L{lane_id}" if lane_id is not None else ""
+                            cv2.putText(out, f"{cls_name}:{tid}{lt}",
                                         (ix1, max(0, iy1 - 6)),
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
 
@@ -556,7 +528,6 @@ def main():
 
     cap.release()
     cv2.destroyAllWindows()
-
     if log_f is not None:
         log_f.close()
 
