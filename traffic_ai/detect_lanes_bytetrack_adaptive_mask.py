@@ -5,26 +5,31 @@ from collections import deque
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 VIDEO_SOURCE = os.path.join(BASE_DIR, "data", "video", "test 3.mp4")
-YOLO_WEIGHTS = "yolov8s.pt"
+
+# ====== TỐI ƯU: dùng yolov8n cho CPU (nhanh). Nếu cần chính xác hơn đổi lại yolov8s.pt ======
+YOLO_WEIGHTS = "yolov8n.pt"
 TRACKER_CFG = "bytetrack.yaml"
 
-# Performance (CPU-friendly)
-WORK_SCALE = 0.85
+# ====== Performance ======
+WORK_SCALE = 1.00      
 DISPLAY_SCALE = 0.80
-IMGSZ = 512
-MAX_DET = 200
-CONF_TRACK = 0.05
+IMGSZ = 768
+MAX_DET = 600        
+CONF_TRACK = 0.05     
 TARGET_CLASS_IDS = [2, 3, 5, 7]  # car, motorcycle, bus, truck
 
-VID_STRIDE = 1  # 1=không bỏ frame; 2=bỏ 1/2 frame; 3=bỏ 2/3 frame...
+# Nếu muốn "mượt cảm giác" hơn nữa: set VID_STRIDE=2.
+# (Nhưng sẽ bỏ bớt frame đầu vào -> ít cập nhật hơn)
+VID_STRIDE = 2
 
-# Class filters
-CAR_MIN_CONF = 0.20
-MOTO_MIN_CONF = 0.05
-BUS_MIN_CONF = 0.22
-TRUCK_MIN_CONF = 0.22
+# ====== Class filters (hạ nhẹ để xe xa vẫn lên box) ======
+CAR_MIN_CONF   = 0.08
+MOTO_MIN_CONF  = 0.03
+BUS_MIN_CONF   = 0.10
+TRUCK_MIN_CONF = 0.10
 
-# Lane rules
+# ====== Lane rules ======
+# TỐI ƯU: nâng 2 điểm "đỉnh trên" lên cao hơn để ROI ăn được xe xa
 ROAD_POLY_NORM = [
     (0.1224, 0.9111),
     (0.9891, 0.9046),
@@ -34,7 +39,7 @@ ROAD_POLY_NORM = [
 BOUNDARY_TS = [0.0000, 0.2194, 0.4742, 0.7374, 1.0000]
 LANE_TYPES = ["motorcycle", "motorcycle", "car", "car"]
 
-# Warp
+# ====== Warp ======
 USE_WARP = True
 WARP_UPDATE_EVERY = 90
 WARP_SCALE = 0.50
@@ -46,33 +51,39 @@ SMOOTH_GAMMA = 0.35
 DEAD_TRANS_PX = 2.0
 DEAD_SCALE = 0.002
 
-# Detect ROI
+# ====== Detect ROI ======
 DETECT_ROI = True
-ROI_PAD_X = 0.06
-ROI_PAD_Y = 0.10
+ROI_PAD_X = 0.2      # nở ROI thêm để ăn xe sát biên
+ROI_PAD_Y = 0.5      # cực quan trọng: nở ROI lên trên để bắt xe xa
 
-# Mask plate: bỏ xe máy
+# ====== Mask plate ======
 MASK_PLATE = True
 MASK_NEAR_Y2_NORM = 0.72
 MASK_NEAR_MIN_H = 120
 
-# Log
+# ====== Log ======
 SAVE_VIOLATIONS = True
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 LOG_CSV = os.path.join(OUTPUT_DIR, "violations_log.csv")
 
-# Draw
+# ====== Draw ======
 DRAW_TEXT = False
 
-# Profiling
+# ====== Profiling ======
 ENABLE_PROFILER = True
 PROF_PRINT_EVERY_SEC = 0.25
 PROF_SMOOTH_N = 30
 
 try:
+    cv2.setUseOptimized(True)
+except Exception:
+    pass
+
+try:
     cv2.setNumThreads(1)
 except Exception:
     pass
+
 try:
     import torch
     torch.set_num_threads(1)
@@ -129,17 +140,17 @@ def warp_points(points_px, H):
     warped = cv2.perspectiveTransform(pts, H).reshape(-1, 2)
     return [(int(x), int(y)) for x, y in warped]
 
-def point_in_poly(px, py, poly):
-    contour = np.array(poly, dtype=np.int32).reshape(-1, 1, 2)
-    return cv2.pointPolygonTest(contour, (float(px), float(py)), False) >= 0
+def point_in_contour(px, py, contour_np_int32):
+    return cv2.pointPolygonTest(contour_np_int32, (float(px), float(py)), False) >= 0
 
-def assign_lane_bottom_center(bbox, lanes_px):
+def assign_lane_bottom_center_cached_contours(bbox, lanes_contours):
+    # lanes_contours: list of (lane_id, contour_np)
     x1, y1, x2, y2 = bbox
     cx = int((x1 + x2) / 2)
     cy = int(y2)
-    for lane in lanes_px:
-        if point_in_poly(cx, cy, lane["poly"]):
-            return lane["id"]
+    for lane_id, cnt in lanes_contours:
+        if point_in_contour(cx, cy, cnt):
+            return lane_id
     return None
 
 def class_min_conf(cls_name):
@@ -178,7 +189,7 @@ def mask_plate(img, bbox):
         return
     cv2.rectangle(img, (px1, py1), (px2, py2), (0, 0, 0), -1)
 
-def roi_from_poly(poly_px, w, h, pad_x=0.06, pad_y=0.10):
+def roi_from_poly(poly_px, w, h, pad_x=0.10, pad_y=0.40):
     xs = [p[0] for p in poly_px]
     ys = [p[1] for p in poly_px]
     x1, x2 = max(0, min(xs)), min(w - 1, max(xs))
@@ -278,13 +289,8 @@ class ReferenceHomographyWarp:
         self.last_good = True
         return self.H, True
 
-
 def pick_device():
-    """
-    Fix lỗi CUDA:
-    - CPU: return ("cpu", False)
-    - GPU: return ("0", True)  # half chỉ bật khi có CUDA thật
-    """
+    # Fix lỗi CUDA: chỉ dùng half nếu có GPU thật
     if torch is None:
         return "cpu", False
     try:
@@ -310,7 +316,7 @@ def main():
         print("[ERROR] Cannot open:", VIDEO_SOURCE)
         return
 
-    # Read first frame for init
+    # init first frame
     ret, f0 = cap.read()
     if not ret:
         print("[ERROR] Cannot read first frame")
@@ -333,39 +339,45 @@ def main():
         pass
 
     device, use_half = pick_device()
-    print(f"[INFO] device={device} half={use_half} IMGSZ={IMGSZ} MAX_DET={MAX_DET} stride={VID_STRIDE}")
+    print(f"[INFO] device={device} half={use_half} weights={YOLO_WEIGHTS} IMGSZ={IMGSZ} MAX_DET={MAX_DET}")
 
     cv2.namedWindow("ITS Stream", cv2.WINDOW_NORMAL)
 
-    # Reset to first frame
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
     frame_idx = 0
     fps_ema = 0.0
     last_t = time.perf_counter()
 
-    # profiler buffers
+    # profiler
     total_hist = deque(maxlen=PROF_SMOOTH_N)
     last_prof_print = time.perf_counter()
+
+    # ====== CACHE lane drawing (khi warp không đổi) ======
+    cached_road_cur_px = None
+    cached_lanes_cur_px = None
+    cached_lane_contours = None  # list[(lane_id, contour_np)]
+    cached_warp_ok = True
+    cached_inl = 0.0
+    cached_goodm = 0
 
     while True:
         t0 = time.perf_counter()
 
-        # 1) READ/DECODE
+        # READ
         t_read0 = time.perf_counter()
         ret, frame = cap.read()
         t_read_ms = (time.perf_counter() - t_read0) * 1000.0
         if not ret:
             break
 
-        # Manual stride skip (vì det_img là numpy -> Ultralytics không tự skip)
+        # optional: skip frames (đọc nhanh bằng grab)
         if VID_STRIDE > 1:
-            # process 1 frame, then skip VID_STRIDE-1 frames using grab()
             for _ in range(VID_STRIDE - 1):
                 if not cap.grab():
                     break
 
-        # 2) RESIZE (WORK_SCALE)
+        # RESIZE
         t_rs0 = time.perf_counter()
         if WORK_SCALE != 1.0:
             frame = cv2.resize(frame, None, fx=WORK_SCALE, fy=WORK_SCALE, interpolation=cv2.INTER_AREA)
@@ -374,25 +386,50 @@ def main():
         frame_idx += 1
         out = frame.copy()
 
-        # 3) WARP update
+        # WARP update / cache
         t_warp0 = time.perf_counter()
         H = np.eye(3, dtype=np.float32)
         warp_ok = True
+        warp_updated = False
+
         if USE_WARP and warp is not None:
             if (frame_idx % WARP_UPDATE_EVERY) == 0:
                 H, warp_ok = warp.update(frame, Ww, Hh)
+                warp_updated = True
             else:
                 H = warp.H
                 warp_ok = warp.last_good
+        else:
+            warp_ok = True
+
         t_warp_ms = (time.perf_counter() - t_warp0) * 1000.0
 
-        # 4) Build current lane polys
+        # Build lane polys only when needed
         t_lane0 = time.perf_counter()
-        road_cur_px = warp_points(road_ref_px, H)
-        lanes_cur_px = [{"id": ln["id"], "type": ln["type"], "poly": warp_points(ln["poly"], H)} for ln in lanes_ref_px]
+        if cached_road_cur_px is None or warp_updated:
+            road_cur_px = warp_points(road_ref_px, H)
+            lanes_cur_px = [{"id": ln["id"], "type": ln["type"], "poly": warp_points(ln["poly"], H)} for ln in lanes_ref_px]
+            # cache contours for pointPolygonTest
+            lane_contours = []
+            for ln in lanes_cur_px:
+                cnt = np.array(ln["poly"], dtype=np.int32).reshape(-1, 1, 2)
+                lane_contours.append((ln["id"], cnt))
+            cached_road_cur_px = road_cur_px
+            cached_lanes_cur_px = lanes_cur_px
+            cached_lane_contours = lane_contours
+            cached_warp_ok = warp_ok
+            if warp is not None:
+                cached_inl = warp.last_inlier
+                cached_goodm = warp.last_good_matches
+        else:
+            road_cur_px = cached_road_cur_px
+            lanes_cur_px = cached_lanes_cur_px
+            lane_contours = cached_lane_contours
+            warp_ok = cached_warp_ok
+
         t_lane_ms = (time.perf_counter() - t_lane0) * 1000.0
 
-        # Draw road/lane
+        # DRAW lanes
         t_draw_lane0 = time.perf_counter()
         cv2.polylines(out, [np.array(road_cur_px, np.int32).reshape(-1, 1, 2)], True, (255, 255, 0), 2)
         for lane in lanes_cur_px:
@@ -400,7 +437,7 @@ def main():
             cv2.polylines(out, [np.array(lane["poly"], np.int32).reshape(-1, 1, 2)], True, col, 2)
         t_draw_lane_ms = (time.perf_counter() - t_draw_lane0) * 1000.0
 
-        # 5) ROI crop for detection
+        # ROI crop
         t_roi0 = time.perf_counter()
         if DETECT_ROI:
             rx1, ry1, rx2, ry2 = roi_from_poly(road_cur_px, Ww, Hh, ROI_PAD_X, ROI_PAD_Y)
@@ -411,7 +448,7 @@ def main():
             offx, offy = 0, 0
         t_roi_ms = (time.perf_counter() - t_roi0) * 1000.0
 
-        # 6) YOLO + ByteTrack
+        # YOLO + ByteTrack
         t_y0 = time.perf_counter()
         track_kwargs = dict(
             persist=True,
@@ -423,14 +460,13 @@ def main():
             verbose=False,
             device=device,
         )
-        # only pass half if CUDA really available
         if use_half and device != "cpu":
             track_kwargs["half"] = True
 
         res = model.track(det_img, **track_kwargs)[0]
         yolo_ms = (time.perf_counter() - t_y0) * 1000.0
 
-        # 7) Extract boxes
+        # Extract boxes
         t_ext0 = time.perf_counter()
         boxes = res.boxes
         if boxes is None or boxes.xyxy is None:
@@ -445,7 +481,7 @@ def main():
             ids = None if boxes.id is None else boxes.id.cpu().numpy().astype(int)
         t_ext_ms = (time.perf_counter() - t_ext0) * 1000.0
 
-        # 8) Postprocess (assign lane + mask + draw boxes + log)
+        # Postprocess + draw boxes
         t_post0 = time.perf_counter()
         violations = 0
         kept = 0
@@ -467,7 +503,7 @@ def main():
             x1 += offx; x2 += offx
             y1 += offy; y2 += offy
 
-            lane_id = assign_lane_bottom_center((x1, y1, x2, y2), lanes_cur_px)
+            lane_id = assign_lane_bottom_center_cached_contours((x1, y1, x2, y2), lane_contours)
             allowed = allowed_lanes_by_cls.get(cls_name, set())
             is_viol = (lane_id is not None) and (len(allowed) > 0) and (lane_id not in allowed)
             if is_viol:
@@ -496,16 +532,15 @@ def main():
 
         t_post_ms = (time.perf_counter() - t_post0) * 1000.0
 
-        # FPS EMA
+        # FPS
         now = time.perf_counter()
         dt = max(1e-6, now - last_t)
         inst_fps = 1.0 / dt
         fps_ema = inst_fps if fps_ema <= 0 else (0.15 * inst_fps + 0.85 * fps_ema)
         last_t = now
 
-        # Warp info
-        inl = warp.last_inlier if (USE_WARP and warp is not None) else 0.0
-        goodm = warp.last_good_matches if (USE_WARP and warp is not None) else 0
+        inl = cached_inl if (USE_WARP and warp is not None) else 0.0
+        goodm = cached_goodm if (USE_WARP and warp is not None) else 0
 
         # HUD
         t_hud0 = time.perf_counter()
@@ -517,7 +552,7 @@ def main():
                     (20, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2, cv2.LINE_AA)
         t_hud_ms = (time.perf_counter() - t_hud0) * 1000.0
 
-        # DISPLAY SCALE
+        # Display
         t_disp0 = time.perf_counter()
         disp = out
         if DISPLAY_SCALE != 1.0:
@@ -525,23 +560,21 @@ def main():
         cv2.imshow("ITS Stream", disp)
         t_disp_ms = (time.perf_counter() - t_disp0) * 1000.0
 
-        # Total
+        # Total + profiler
         t_total_ms = (time.perf_counter() - t0) * 1000.0
         total_hist.append(t_total_ms)
         avg_ms = sum(total_hist) / len(total_hist)
         fps_est = 1000.0 / avg_ms if avg_ms > 0 else 0.0
 
-        # Print profiler line (throttled)
-        if ENABLE_PROFILER:
-            if (time.perf_counter() - last_prof_print) >= PROF_PRINT_EVERY_SEC:
-                print(
-                    f"ms total={t_total_ms:.1f} (avg={avg_ms:.1f},FPS~{fps_est:.1f}) | "
-                    f"read={t_read_ms:.1f} rs={t_rs_ms:.1f} warp={t_warp_ms:.1f} lane={t_lane_ms:.1f} "
-                    f"drawLane={t_draw_lane_ms:.1f} roi={t_roi_ms:.1f} yolo={yolo_ms:.1f} "
-                    f"ext={t_ext_ms:.1f} post={t_post_ms:.1f} hud={t_hud_ms:.1f} disp={t_disp_ms:.1f}",
-                    end="\r"
-                )
-                last_prof_print = time.perf_counter()
+        if ENABLE_PROFILER and (time.perf_counter() - last_prof_print) >= PROF_PRINT_EVERY_SEC:
+            print(
+                f"ms total={t_total_ms:.1f} (avg={avg_ms:.1f},FPS~{fps_est:.1f}) | "
+                f"read={t_read_ms:.1f} rs={t_rs_ms:.1f} warp={t_warp_ms:.1f} lane={t_lane_ms:.1f} "
+                f"drawLane={t_draw_lane_ms:.1f} roi={t_roi_ms:.1f} yolo={yolo_ms:.1f} "
+                f"ext={t_ext_ms:.1f} post={t_post_ms:.1f} hud={t_hud_ms:.1f} disp={t_disp_ms:.1f}",
+                end="\r"
+            )
+            last_prof_print = time.perf_counter()
 
         if (cv2.waitKey(1) & 0xFF) == ord("q"):
             break
