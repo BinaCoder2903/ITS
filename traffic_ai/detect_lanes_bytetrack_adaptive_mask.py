@@ -6,35 +6,45 @@ from collections import deque
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 VIDEO_SOURCE = os.path.join(BASE_DIR, "data", "video", "test 3.mp4")
 
-# ====== TỐI ƯU: dùng yolov8n cho CPU (nhanh). Nếu cần chính xác hơn đổi lại yolov8s.pt ======
-YOLO_WEIGHTS = "yolov8n.pt"
+# ====== Model ======
+# Nếu muốn "bắt chắc" hơn: yolov8s.pt (đang dùng)
+# Nếu CPU yếu quá: đổi sang yolov8n.pt để mượt hơn
+YOLO_WEIGHTS = "yolov8s.pt"
 TRACKER_CFG = "bytetrack.yaml"
 
 # ====== Performance ======
-WORK_SCALE = 1.00      
+WORK_SCALE = 1.00       # để bắt xe xa tốt (khuyên giữ 1.0 khi thầy soi)
 DISPLAY_SCALE = 0.80
-IMGSZ = 768
-MAX_DET = 600        
-CONF_TRACK = 0.05     
+IMGSZ = 640
+MAX_DET = 400
+CONF_TRACK = 0.08       # tăng nhẹ để bớt rác (0.05 vẫn ok nếu cần recall hơn)
 TARGET_CLASS_IDS = [2, 3, 5, 7]  # car, motorcycle, bus, truck
 
-# Nếu muốn "mượt cảm giác" hơn nữa: set VID_STRIDE=2.
-# (Nhưng sẽ bỏ bớt frame đầu vào -> ít cập nhật hơn)
-VID_STRIDE = 2
+VID_STRIDE = 1  # 2 = mượt hơn (skip frame) nhưng cập nhật thưa hơn
 
-# ====== Class filters (hạ nhẹ để xe xa vẫn lên box) ======
-CAR_MIN_CONF   = 0.08
-MOTO_MIN_CONF  = 0.03
-BUS_MIN_CONF   = 0.10
-TRUCK_MIN_CONF = 0.10
+# ====== High Recall for FAR pass (bắt xe xa) ======
+ENABLE_FAR_PASS = True
+FAR_EVERY = 3                 # chạy far-pass mỗi 3 frame (tăng recall mà không quá nặng)
+FAR_TOP_FRAC = 0.65           # dùng phần "trên" của ROI: 0.65 => lấy ~65% chiều cao từ trên xuống
+FAR_IMGSZ = 960               # upscale mạnh hơn để bắt xe xa nhỏ (nặng hơn 640). Nếu lag, hạ về 768/640
+FAR_CONF = 0.04               # thấp để không bỏ xe xa
+FAR_MAX_DET = 600
+FAR_IOU_SUPPRESS = 0.50       # nếu FAR box chồng lên NEAR > 0.5 thì bỏ (tránh trùng)
+FAR_AUGMENT = False           # True = recall tăng chút nhưng nặng hơn
+
+# ====== Class filters (đừng cao quá kẻo xe xa bị bỏ) ======
+CAR_MIN_CONF = 0.10
+MOTO_MIN_CONF = 0.05
+BUS_MIN_CONF = 0.12
+TRUCK_MIN_CONF = 0.12
 
 # ====== Lane rules ======
-# TỐI ƯU: nâng 2 điểm "đỉnh trên" lên cao hơn để ROI ăn được xe xa
+# LƯU Ý: nếu ROI/lane bị thấp quá sẽ cắt xe xa. Bạn có thể nâng 2 điểm top lên.
 ROAD_POLY_NORM = [
     (0.1224, 0.9111),
     (0.9891, 0.9046),
-    (0.7052, 0.4157),
-    (0.3443, 0.4343),
+    (0.7052, 0.30),   # nâng lên để ăn phần xa
+    (0.3443, 0.32),
 ]
 BOUNDARY_TS = [0.0000, 0.2194, 0.4742, 0.7374, 1.0000]
 LANE_TYPES = ["motorcycle", "motorcycle", "car", "car"]
@@ -53,8 +63,8 @@ DEAD_SCALE = 0.002
 
 # ====== Detect ROI ======
 DETECT_ROI = True
-ROI_PAD_X = 0.2      # nở ROI thêm để ăn xe sát biên
-ROI_PAD_Y = 0.5      # cực quan trọng: nở ROI lên trên để bắt xe xa
+ROI_PAD_X = 0.10
+ROI_PAD_Y = 0.45              # tăng pad Y để không cắt xe xa
 
 # ====== Mask plate ======
 MASK_PLATE = True
@@ -140,56 +150,7 @@ def warp_points(points_px, H):
     warped = cv2.perspectiveTransform(pts, H).reshape(-1, 2)
     return [(int(x), int(y)) for x, y in warped]
 
-def point_in_contour(px, py, contour_np_int32):
-    return cv2.pointPolygonTest(contour_np_int32, (float(px), float(py)), False) >= 0
-
-def assign_lane_bottom_center_cached_contours(bbox, lanes_contours):
-    # lanes_contours: list of (lane_id, contour_np)
-    x1, y1, x2, y2 = bbox
-    cx = int((x1 + x2) / 2)
-    cy = int(y2)
-    for lane_id, cnt in lanes_contours:
-        if point_in_contour(cx, cy, cnt):
-            return lane_id
-    return None
-
-def class_min_conf(cls_name):
-    if cls_name == "car": return CAR_MIN_CONF
-    if cls_name == "motorcycle": return MOTO_MIN_CONF
-    if cls_name == "bus": return BUS_MIN_CONF
-    if cls_name == "truck": return TRUCK_MIN_CONF
-    return 0.0
-
-def should_mask(bbox_xyxy, img_h, cls_name):
-    if not MASK_PLATE:
-        return False
-    if cls_name == "motorcycle":
-        return False
-    x1, y1, x2, y2 = bbox_xyxy
-    bh = max(0.0, y2 - y1)
-    return (y2 >= img_h * MASK_NEAR_Y2_NORM) or (bh >= MASK_NEAR_MIN_H)
-
-def mask_plate(img, bbox):
-    x1, y1, x2, y2 = bbox
-    x1 = int(max(0, x1)); y1 = int(max(0, y1))
-    x2 = int(min(img.shape[1] - 1, x2)); y2 = int(min(img.shape[0] - 1, y2))
-    if x2 <= x1 or y2 <= y1:
-        return
-    bw = max(1, x2 - x1)
-    bh = max(1, y2 - y1)
-    if bh < 80:
-        return
-    px1 = int(x1 + 0.28 * bw)
-    px2 = int(x1 + 0.72 * bw)
-    py1 = int(y1 + 0.72 * bh)
-    py2 = int(y2 - 0.08 * bh)
-    px1 = max(0, px1); py1 = max(0, py1)
-    px2 = min(img.shape[1], px2); py2 = min(img.shape[0], py2)
-    if px2 <= px1 or py2 <= py1:
-        return
-    cv2.rectangle(img, (px1, py1), (px2, py2), (0, 0, 0), -1)
-
-def roi_from_poly(poly_px, w, h, pad_x=0.10, pad_y=0.40):
+def roi_from_poly(poly_px, w, h, pad_x=0.10, pad_y=0.45):
     xs = [p[0] for p in poly_px]
     ys = [p[1] for p in poly_px]
     x1, x2 = max(0, min(xs)), min(w - 1, max(xs))
@@ -289,8 +250,59 @@ class ReferenceHomographyWarp:
         self.last_good = True
         return self.H, True
 
+
+def class_min_conf(cls_name):
+    if cls_name == "car": return CAR_MIN_CONF
+    if cls_name == "motorcycle": return MOTO_MIN_CONF
+    if cls_name == "bus": return BUS_MIN_CONF
+    if cls_name == "truck": return TRUCK_MIN_CONF
+    return 0.0
+
+def should_mask(bbox_xyxy, img_h, cls_name):
+    if not MASK_PLATE:
+        return False
+    if cls_name == "motorcycle":
+        return False
+    x1, y1, x2, y2 = bbox_xyxy
+    bh = max(0.0, y2 - y1)
+    return (y2 >= img_h * MASK_NEAR_Y2_NORM) or (bh >= MASK_NEAR_MIN_H)
+
+def mask_plate(img, bbox):
+    x1, y1, x2, y2 = bbox
+    x1 = int(max(0, x1)); y1 = int(max(0, y1))
+    x2 = int(min(img.shape[1] - 1, x2)); y2 = int(min(img.shape[0] - 1, y2))
+    if x2 <= x1 or y2 <= y1:
+        return
+    bw = max(1, x2 - x1)
+    bh = max(1, y2 - y1)
+    if bh < 80:
+        return
+    px1 = int(x1 + 0.28 * bw)
+    px2 = int(x1 + 0.72 * bw)
+    py1 = int(y1 + 0.72 * bh)
+    py2 = int(y2 - 0.08 * bh)
+    px1 = max(0, px1); py1 = max(0, py1)
+    px2 = min(img.shape[1], px2); py2 = min(img.shape[0], py2)
+    if px2 <= px1 or py2 <= py1:
+        return
+    cv2.rectangle(img, (px1, py1), (px2, py2), (0, 0, 0), -1)
+
+def point_in_poly(px, py, poly):
+    contour = np.array(poly, dtype=np.int32).reshape(-1, 1, 2)
+    return cv2.pointPolygonTest(contour, (float(px), float(py)), False) >= 0
+
+def assign_lane_bottom_center(bbox, lanes_px):
+    x1, y1, x2, y2 = bbox
+    cx = int((x1 + x2) / 2)
+    cy = int(y2)
+    for lane in lanes_px:
+        if point_in_poly(cx, cy, lane["poly"]):
+            return lane["id"]
+    return None
+
+
 def pick_device():
-    # Fix lỗi CUDA: chỉ dùng half nếu có GPU thật
+    # Fix lỗi CUDA: chỉ bật half nếu GPU thật
     if torch is None:
         return "cpu", False
     try:
@@ -299,6 +311,23 @@ def pick_device():
     except Exception:
         pass
     return "cpu", False
+
+
+def iou_xyxy(a, b):
+    # a: (4,), b: (N,4) or (4,)
+    ax1, ay1, ax2, ay2 = a
+    bx1 = b[:, 0]; by1 = b[:, 1]; bx2 = b[:, 2]; by2 = b[:, 3]
+    inter_x1 = np.maximum(ax1, bx1)
+    inter_y1 = np.maximum(ay1, by1)
+    inter_x2 = np.minimum(ax2, bx2)
+    inter_y2 = np.minimum(ay2, by2)
+    iw = np.maximum(0.0, inter_x2 - inter_x1)
+    ih = np.maximum(0.0, inter_y2 - inter_y1)
+    inter = iw * ih
+    area_a = np.maximum(0.0, ax2 - ax1) * np.maximum(0.0, ay2 - ay1)
+    area_b = np.maximum(0.0, bx2 - bx1) * np.maximum(0.0, by2 - by1)
+    union = area_a + area_b - inter + 1e-8
+    return inter / union
 
 
 def main():
@@ -316,7 +345,6 @@ def main():
         print("[ERROR] Cannot open:", VIDEO_SOURCE)
         return
 
-    # init first frame
     ret, f0 = cap.read()
     if not ret:
         print("[ERROR] Cannot read first frame")
@@ -332,14 +360,16 @@ def main():
 
     warp = ReferenceHomographyWarp(f0, road_ref_px) if USE_WARP else None
 
-    model = YOLO(YOLO_WEIGHTS)
+    model = YOLO(YOLO_WEIGHTS)      # for track (near)
+    model_far = YOLO(YOLO_WEIGHTS)  # for predict (far)
     try:
         model.fuse()
+        model_far.fuse()
     except Exception:
         pass
 
     device, use_half = pick_device()
-    print(f"[INFO] device={device} half={use_half} weights={YOLO_WEIGHTS} IMGSZ={IMGSZ} MAX_DET={MAX_DET}")
+    print(f"[INFO] device={device} half={use_half} IMGSZ={IMGSZ} MAX_DET={MAX_DET} FAR={ENABLE_FAR_PASS}")
 
     cv2.namedWindow("ITS Stream", cv2.WINDOW_NORMAL)
 
@@ -349,17 +379,14 @@ def main():
     fps_ema = 0.0
     last_t = time.perf_counter()
 
-    # profiler
     total_hist = deque(maxlen=PROF_SMOOTH_N)
     last_prof_print = time.perf_counter()
 
-    # ====== CACHE lane drawing (khi warp không đổi) ======
-    cached_road_cur_px = None
-    cached_lanes_cur_px = None
-    cached_lane_contours = None  # list[(lane_id, contour_np)]
-    cached_warp_ok = True
-    cached_inl = 0.0
-    cached_goodm = 0
+    # cache FAR results between frames (so boxes don't "blink")
+    far_cache_xyxy = np.zeros((0, 4), dtype=np.float32)
+    far_cache_cls = np.zeros((0,), dtype=int)
+    far_cache_conf = np.zeros((0,), dtype=np.float32)
+    far_cache_age = 0
 
     while True:
         t0 = time.perf_counter()
@@ -371,7 +398,7 @@ def main():
         if not ret:
             break
 
-        # optional: skip frames (đọc nhanh bằng grab)
+        # manual stride skip
         if VID_STRIDE > 1:
             for _ in range(VID_STRIDE - 1):
                 if not cap.grab():
@@ -386,58 +413,29 @@ def main():
         frame_idx += 1
         out = frame.copy()
 
-        # WARP update / cache
+        # WARP
         t_warp0 = time.perf_counter()
         H = np.eye(3, dtype=np.float32)
         warp_ok = True
-        warp_updated = False
-
         if USE_WARP and warp is not None:
             if (frame_idx % WARP_UPDATE_EVERY) == 0:
                 H, warp_ok = warp.update(frame, Ww, Hh)
-                warp_updated = True
             else:
                 H = warp.H
                 warp_ok = warp.last_good
-        else:
-            warp_ok = True
-
         t_warp_ms = (time.perf_counter() - t_warp0) * 1000.0
 
-        # Build lane polys only when needed
-        t_lane0 = time.perf_counter()
-        if cached_road_cur_px is None or warp_updated:
-            road_cur_px = warp_points(road_ref_px, H)
-            lanes_cur_px = [{"id": ln["id"], "type": ln["type"], "poly": warp_points(ln["poly"], H)} for ln in lanes_ref_px]
-            # cache contours for pointPolygonTest
-            lane_contours = []
-            for ln in lanes_cur_px:
-                cnt = np.array(ln["poly"], dtype=np.int32).reshape(-1, 1, 2)
-                lane_contours.append((ln["id"], cnt))
-            cached_road_cur_px = road_cur_px
-            cached_lanes_cur_px = lanes_cur_px
-            cached_lane_contours = lane_contours
-            cached_warp_ok = warp_ok
-            if warp is not None:
-                cached_inl = warp.last_inlier
-                cached_goodm = warp.last_good_matches
-        else:
-            road_cur_px = cached_road_cur_px
-            lanes_cur_px = cached_lanes_cur_px
-            lane_contours = cached_lane_contours
-            warp_ok = cached_warp_ok
+        # lanes (current)
+        road_cur_px = warp_points(road_ref_px, H)
+        lanes_cur_px = [{"id": ln["id"], "type": ln["type"], "poly": warp_points(ln["poly"], H)} for ln in lanes_ref_px]
 
-        t_lane_ms = (time.perf_counter() - t_lane0) * 1000.0
-
-        # DRAW lanes
-        t_draw_lane0 = time.perf_counter()
+        # draw lanes
         cv2.polylines(out, [np.array(road_cur_px, np.int32).reshape(-1, 1, 2)], True, (255, 255, 0), 2)
         for lane in lanes_cur_px:
             col = (255, 0, 0) if lane["type"] == "car" else (0, 255, 255)
             cv2.polylines(out, [np.array(lane["poly"], np.int32).reshape(-1, 1, 2)], True, col, 2)
-        t_draw_lane_ms = (time.perf_counter() - t_draw_lane0) * 1000.0
 
-        # ROI crop
+        # ROI crop (near)
         t_roi0 = time.perf_counter()
         if DETECT_ROI:
             rx1, ry1, rx2, ry2 = roi_from_poly(road_cur_px, Ww, Hh, ROI_PAD_X, ROI_PAD_Y)
@@ -446,9 +444,10 @@ def main():
         else:
             det_img = frame
             offx, offy = 0, 0
+            rx1, ry1, rx2, ry2 = 0, 0, Ww, Hh
         t_roi_ms = (time.perf_counter() - t_roi0) * 1000.0
 
-        # YOLO + ByteTrack
+        # ===== PASS 1: NEAR track =====
         t_y0 = time.perf_counter()
         track_kwargs = dict(
             persist=True,
@@ -466,44 +465,143 @@ def main():
         res = model.track(det_img, **track_kwargs)[0]
         yolo_ms = (time.perf_counter() - t_y0) * 1000.0
 
-        # Extract boxes
-        t_ext0 = time.perf_counter()
         boxes = res.boxes
         if boxes is None or boxes.xyxy is None:
-            xyxy = np.zeros((0, 4), dtype=np.float32)
-            cls = np.zeros((0,), dtype=int)
-            confs = np.zeros((0,), dtype=np.float32)
-            ids = None
+            near_xyxy = np.zeros((0, 4), dtype=np.float32)
+            near_cls = np.zeros((0,), dtype=int)
+            near_conf = np.zeros((0,), dtype=np.float32)
+            near_ids = None
         else:
-            xyxy = boxes.xyxy.cpu().numpy().astype(np.float32)
-            cls = boxes.cls.cpu().numpy().astype(int)
-            confs = boxes.conf.cpu().numpy().astype(np.float32) if boxes.conf is not None else np.ones((len(xyxy),), dtype=np.float32)
-            ids = None if boxes.id is None else boxes.id.cpu().numpy().astype(int)
-        t_ext_ms = (time.perf_counter() - t_ext0) * 1000.0
+            near_xyxy = boxes.xyxy.cpu().numpy().astype(np.float32)
+            near_cls = boxes.cls.cpu().numpy().astype(int)
+            near_conf = boxes.conf.cpu().numpy().astype(np.float32) if boxes.conf is not None else np.ones((len(near_xyxy),), dtype=np.float32)
+            near_ids = None if boxes.id is None else boxes.id.cpu().numpy().astype(int)
 
-        # Postprocess + draw boxes
+        # offset near boxes back to full frame
+        if len(near_xyxy) > 0:
+            near_xyxy[:, [0, 2]] += float(offx)
+            near_xyxy[:, [1, 3]] += float(offy)
+
+        # ===== PASS 2: FAR predict (multi-scale) =====
+        t_far_ms = 0.0
+        if ENABLE_FAR_PASS:
+            far_cache_age += 1
+
+            # define far ROI = top part of ROI, then upscale by FAR_IMGSZ inside predict()
+            roi_h = max(1, (ry2 - ry1))
+            far_y1 = ry1
+            far_y2 = ry1 + int(roi_h * FAR_TOP_FRAC)
+            far_x1 = rx1
+            far_x2 = rx2
+
+            # clamp
+            far_y1 = max(0, min(Hh - 1, far_y1))
+            far_y2 = max(0, min(Hh, far_y2))
+            far_x1 = max(0, min(Ww - 1, far_x1))
+            far_x2 = max(0, min(Ww, far_x2))
+
+            do_far = (frame_idx % FAR_EVERY) == 0
+            if do_far and far_y2 > far_y1 and far_x2 > far_x1:
+                t_f0 = time.perf_counter()
+                far_img = frame[far_y1:far_y2, far_x1:far_x2]
+
+                pred_kwargs = dict(
+                    imgsz=FAR_IMGSZ,
+                    conf=FAR_CONF,
+                    classes=TARGET_CLASS_IDS,
+                    max_det=FAR_MAX_DET,
+                    device=device,
+                    verbose=False,
+                    augment=FAR_AUGMENT,
+                )
+                if use_half and device != "cpu":
+                    pred_kwargs["half"] = True
+
+                far_res = model_far.predict(far_img, **pred_kwargs)[0]
+                t_far_ms = (time.perf_counter() - t_f0) * 1000.0
+
+                fboxes = far_res.boxes
+                if fboxes is None or fboxes.xyxy is None:
+                    far_xyxy = np.zeros((0, 4), dtype=np.float32)
+                    far_cls = np.zeros((0,), dtype=int)
+                    far_conf = np.zeros((0,), dtype=np.float32)
+                else:
+                    far_xyxy = fboxes.xyxy.cpu().numpy().astype(np.float32)
+                    far_cls = fboxes.cls.cpu().numpy().astype(int)
+                    far_conf = fboxes.conf.cpu().numpy().astype(np.float32) if fboxes.conf is not None else np.ones((len(far_xyxy),), dtype=np.float32)
+
+                # offset to full frame
+                if len(far_xyxy) > 0:
+                    far_xyxy[:, [0, 2]] += float(far_x1)
+                    far_xyxy[:, [1, 3]] += float(far_y1)
+
+                # cache it (so it doesn't blink between far frames)
+                far_cache_xyxy = far_xyxy
+                far_cache_cls = far_cls
+                far_cache_conf = far_conf
+                far_cache_age = 0
+
+        # if cache too old, drop it
+        if far_cache_age > max(2, FAR_EVERY * 2):
+            far_cache_xyxy = np.zeros((0, 4), dtype=np.float32)
+            far_cache_cls = np.zeros((0,), dtype=int)
+            far_cache_conf = np.zeros((0,), dtype=np.float32)
+
+        # ===== MERGE: add FAR boxes that are not already covered by NEAR =====
+        merged_xyxy = near_xyxy
+        merged_cls = near_cls
+        merged_conf = near_conf
+        merged_ids = near_ids
+
+        if ENABLE_FAR_PASS and len(far_cache_xyxy) > 0:
+            keep_far_idx = []
+            if len(near_xyxy) == 0:
+                keep_far_idx = list(range(len(far_cache_xyxy)))
+            else:
+                for j in range(len(far_cache_xyxy)):
+                    ious = iou_xyxy(far_cache_xyxy[j], near_xyxy)
+                    if float(ious.max()) < FAR_IOU_SUPPRESS:
+                        keep_far_idx.append(j)
+
+            if keep_far_idx:
+                far_k_xyxy = far_cache_xyxy[keep_far_idx]
+                far_k_cls = far_cache_cls[keep_far_idx]
+                far_k_conf = far_cache_conf[keep_far_idx]
+
+                merged_xyxy = np.concatenate([merged_xyxy, far_k_xyxy], axis=0) if len(merged_xyxy) else far_k_xyxy
+                merged_cls = np.concatenate([merged_cls, far_k_cls], axis=0) if len(merged_cls) else far_k_cls
+                merged_conf = np.concatenate([merged_conf, far_k_conf], axis=0) if len(merged_conf) else far_k_conf
+
+                # FAR ids are negative (unique)
+                far_ids = -100000 - np.arange(len(far_k_xyxy), dtype=int)
+                if merged_ids is None and len(near_xyxy) > 0:
+                    # if tracker didn't return ids, create temp for near
+                    merged_ids = np.arange(1, len(near_xyxy) + 1, dtype=int)
+                if merged_ids is None:
+                    merged_ids = far_ids
+                else:
+                    merged_ids = np.concatenate([merged_ids, far_ids], axis=0)
+
+        # ===== POSTPROCESS + DRAW =====
         t_post0 = time.perf_counter()
         violations = 0
         kept = 0
 
-        for i in range(len(xyxy)):
-            cls_id = int(cls[i])
+        for i in range(len(merged_xyxy)):
+            cls_id = int(merged_cls[i])
             cls_name = model.names.get(cls_id, str(cls_id))
             if cls_name == "motorbike":
                 cls_name = "motorcycle"
-            c = float(confs[i])
+            c = float(merged_conf[i])
 
             if c < class_min_conf(cls_name):
                 continue
 
             kept += 1
-            tid = int(ids[i]) if ids is not None else (i + 1)
+            tid = int(merged_ids[i]) if merged_ids is not None else (i + 1)
 
-            x1, y1, x2, y2 = xyxy[i]
-            x1 += offx; x2 += offx
-            y1 += offy; y2 += offy
-
-            lane_id = assign_lane_bottom_center_cached_contours((x1, y1, x2, y2), lane_contours)
+            x1, y1, x2, y2 = merged_xyxy[i]
+            lane_id = assign_lane_bottom_center((x1, y1, x2, y2), lanes_cur_px)
             allowed = allowed_lanes_by_cls.get(cls_name, set())
             is_viol = (lane_id is not None) and (len(allowed) > 0) and (lane_id not in allowed)
             if is_viol:
@@ -532,27 +630,25 @@ def main():
 
         t_post_ms = (time.perf_counter() - t_post0) * 1000.0
 
-        # FPS
+        # FPS EMA
         now = time.perf_counter()
         dt = max(1e-6, now - last_t)
         inst_fps = 1.0 / dt
         fps_ema = inst_fps if fps_ema <= 0 else (0.15 * inst_fps + 0.85 * fps_ema)
         last_t = now
 
-        inl = cached_inl if (USE_WARP and warp is not None) else 0.0
-        goodm = cached_goodm if (USE_WARP and warp is not None) else 0
+        inl = warp.last_inlier if (USE_WARP and warp is not None) else 0.0
+        goodm = warp.last_good_matches if (USE_WARP and warp is not None) else 0
 
         # HUD
-        t_hud0 = time.perf_counter()
         cv2.putText(out,
-                    f"fps={fps_ema:.1f} yolo={yolo_ms:.0f}ms kept={kept} viol={violations} imgsz={IMGSZ}",
+                    f"fps={fps_ema:.1f} near={yolo_ms:.0f}ms far={t_far_ms:.0f}ms kept={kept} viol={violations}",
                     (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2, cv2.LINE_AA)
         cv2.putText(out,
-                    f"warp={'OK' if warp_ok else 'HOLD'} inl={inl:.2f} good={goodm} every={WARP_UPDATE_EVERY} stride={VID_STRIDE}",
+                    f"warp={'OK' if warp_ok else 'HOLD'} inl={inl:.2f} good={goodm} stride={VID_STRIDE} farEvery={FAR_EVERY}",
                     (20, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2, cv2.LINE_AA)
-        t_hud_ms = (time.perf_counter() - t_hud0) * 1000.0
 
-        # Display
+        # display
         t_disp0 = time.perf_counter()
         disp = out
         if DISPLAY_SCALE != 1.0:
@@ -560,7 +656,7 @@ def main():
         cv2.imshow("ITS Stream", disp)
         t_disp_ms = (time.perf_counter() - t_disp0) * 1000.0
 
-        # Total + profiler
+        # profiler
         t_total_ms = (time.perf_counter() - t0) * 1000.0
         total_hist.append(t_total_ms)
         avg_ms = sum(total_hist) / len(total_hist)
@@ -568,10 +664,9 @@ def main():
 
         if ENABLE_PROFILER and (time.perf_counter() - last_prof_print) >= PROF_PRINT_EVERY_SEC:
             print(
-                f"ms total={t_total_ms:.1f} (avg={avg_ms:.1f},FPS~{fps_est:.1f}) | "
-                f"read={t_read_ms:.1f} rs={t_rs_ms:.1f} warp={t_warp_ms:.1f} lane={t_lane_ms:.1f} "
-                f"drawLane={t_draw_lane_ms:.1f} roi={t_roi_ms:.1f} yolo={yolo_ms:.1f} "
-                f"ext={t_ext_ms:.1f} post={t_post_ms:.1f} hud={t_hud_ms:.1f} disp={t_disp_ms:.1f}",
+                f"ms total={t_total_ms:.1f}(avg={avg_ms:.1f},FPS~{fps_est:.1f}) "
+                f"| read={t_read_ms:.1f} rs={t_rs_ms:.1f} warp={t_warp_ms:.1f} roi={t_roi_ms:.1f} "
+                f"near={yolo_ms:.1f} far={t_far_ms:.1f} post={t_post_ms:.1f} disp={t_disp_ms:.1f}",
                 end="\r"
             )
             last_prof_print = time.perf_counter()
