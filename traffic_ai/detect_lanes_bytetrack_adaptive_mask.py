@@ -6,50 +6,40 @@ from collections import deque
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 VIDEO_SOURCE = os.path.join(BASE_DIR, "data", "video", "test 3.mp4")
 
-# ====== Model ======
-# Nếu muốn "bắt chắc" hơn: yolov8s.pt (đang dùng)
-# Nếu CPU yếu quá: đổi sang yolov8n.pt để mượt hơn
 YOLO_WEIGHTS = "yolov8s.pt"
 TRACKER_CFG = "bytetrack.yaml"
 
-# ====== Performance ======
-WORK_SCALE = 1.00       # để bắt xe xa tốt (khuyên giữ 1.0 khi thầy soi)
+WORK_SCALE = 1.00
 DISPLAY_SCALE = 0.80
 IMGSZ = 640
-MAX_DET = 400
-CONF_TRACK = 0.08       # tăng nhẹ để bớt rác (0.05 vẫn ok nếu cần recall hơn)
-TARGET_CLASS_IDS = [2, 3, 5, 7]  # car, motorcycle, bus, truck
+MAX_DET = 200
+CONF_TRACK = 0.08
+TARGET_CLASS_IDS = [2, 3, 5, 7]
+VID_STRIDE = 1
 
-VID_STRIDE = 1  # 2 = mượt hơn (skip frame) nhưng cập nhật thưa hơn
-
-# ====== High Recall for FAR pass (bắt xe xa) ======
 ENABLE_FAR_PASS = True
-FAR_EVERY = 3                 # chạy far-pass mỗi 3 frame (tăng recall mà không quá nặng)
-FAR_TOP_FRAC = 0.65           # dùng phần "trên" của ROI: 0.65 => lấy ~65% chiều cao từ trên xuống
-FAR_IMGSZ = 960               # upscale mạnh hơn để bắt xe xa nhỏ (nặng hơn 640). Nếu lag, hạ về 768/640
-FAR_CONF = 0.04               # thấp để không bỏ xe xa
-FAR_MAX_DET = 600
-FAR_IOU_SUPPRESS = 0.50       # nếu FAR box chồng lên NEAR > 0.5 thì bỏ (tránh trùng)
-FAR_AUGMENT = False           # True = recall tăng chút nhưng nặng hơn
+FAR_EVERY = 6
+FAR_TOP_FRAC = 0.65
+FAR_IMGSZ = 768
+FAR_CONF = 0.05
+FAR_MAX_DET = 250
+FAR_IOU_SUPPRESS = 0.50
+FAR_AUGMENT = False
 
-# ====== Class filters (đừng cao quá kẻo xe xa bị bỏ) ======
 CAR_MIN_CONF = 0.10
 MOTO_MIN_CONF = 0.05
 BUS_MIN_CONF = 0.12
 TRUCK_MIN_CONF = 0.12
 
-# ====== Lane rules ======
-# LƯU Ý: nếu ROI/lane bị thấp quá sẽ cắt xe xa. Bạn có thể nâng 2 điểm top lên.
 ROAD_POLY_NORM = [
-    (0.1224, 0.9111),
-    (0.9891, 0.9046),
-    (0.7052, 0.30),   # nâng lên để ăn phần xa
-    (0.3443, 0.32),
+    (0.1208, 0.9176),
+    (0.9938, 0.9157),
+    (0.6885, 0.3519),
+    (0.3672, 0.3556),
 ]
 BOUNDARY_TS = [0.0000, 0.2194, 0.4742, 0.7374, 1.0000]
 LANE_TYPES = ["motorcycle", "motorcycle", "car", "car"]
 
-# ====== Warp ======
 USE_WARP = True
 WARP_UPDATE_EVERY = 90
 WARP_SCALE = 0.50
@@ -61,25 +51,20 @@ SMOOTH_GAMMA = 0.35
 DEAD_TRANS_PX = 2.0
 DEAD_SCALE = 0.002
 
-# ====== Detect ROI ======
 DETECT_ROI = True
-ROI_PAD_X = 0.10
-ROI_PAD_Y = 0.45              # tăng pad Y để không cắt xe xa
+ROI_PAD_X = 0.03
+ROI_PAD_Y = 0.35
 
-# ====== Mask plate ======
 MASK_PLATE = True
 MASK_NEAR_Y2_NORM = 0.72
 MASK_NEAR_MIN_H = 120
 
-# ====== Log ======
 SAVE_VIOLATIONS = True
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 LOG_CSV = os.path.join(OUTPUT_DIR, "violations_log.csv")
 
-# ====== Draw ======
 DRAW_TEXT = False
 
-# ====== Profiling ======
 ENABLE_PROFILER = True
 PROF_PRINT_EVERY_SEC = 0.25
 PROF_SMOOTH_N = 30
@@ -88,7 +73,6 @@ try:
     cv2.setUseOptimized(True)
 except Exception:
     pass
-
 try:
     cv2.setNumThreads(1)
 except Exception:
@@ -138,19 +122,63 @@ def build_allowed_lanes(lanes_cfg):
         lanes_by_type.setdefault(lane["type"], []).append(lane["id"])
     car_lanes = set(lanes_by_type.get("car", []))
     moto_lanes = set(lanes_by_type.get("motorcycle", []))
-    return {
-        "car": car_lanes,
-        "bus": car_lanes,
-        "truck": car_lanes,
-        "motorcycle": moto_lanes,
-    }
+    return {"car": car_lanes, "bus": car_lanes, "truck": car_lanes, "motorcycle": moto_lanes}
 
 def warp_points(points_px, H):
     pts = np.float32(points_px).reshape(-1, 1, 2)
     warped = cv2.perspectiveTransform(pts, H).reshape(-1, 2)
     return [(int(x), int(y)) for x, y in warped]
 
-def roi_from_poly(poly_px, w, h, pad_x=0.10, pad_y=0.45):
+def point_in_poly(px, py, poly):
+    contour = np.array(poly, dtype=np.int32).reshape(-1, 1, 2)
+    return cv2.pointPolygonTest(contour, (float(px), float(py)), False) >= 0
+
+def assign_lane_bottom_center(bbox, lanes_px):
+    x1, y1, x2, y2 = bbox
+    cx = int((x1 + x2) / 2)
+    cy = int(y2)
+    for lane in lanes_px:
+        if point_in_poly(cx, cy, lane["poly"]):
+            return lane["id"]
+    return None
+
+def class_min_conf(cls_name):
+    if cls_name == "car": return CAR_MIN_CONF
+    if cls_name == "motorcycle": return MOTO_MIN_CONF
+    if cls_name == "bus": return BUS_MIN_CONF
+    if cls_name == "truck": return TRUCK_MIN_CONF
+    return 0.0
+
+def should_mask(bbox_xyxy, img_h, cls_name):
+    if not MASK_PLATE:
+        return False
+    if cls_name == "motorcycle":
+        return False
+    x1, y1, x2, y2 = bbox_xyxy
+    bh = max(0.0, y2 - y1)
+    return (y2 >= img_h * MASK_NEAR_Y2_NORM) or (bh >= MASK_NEAR_MIN_H)
+
+def mask_plate(img, bbox):
+    x1, y1, x2, y2 = bbox
+    x1 = int(max(0, x1)); y1 = int(max(0, y1))
+    x2 = int(min(img.shape[1] - 1, x2)); y2 = int(min(img.shape[0] - 1, y2))
+    if x2 <= x1 or y2 <= y1:
+        return
+    bw = max(1, x2 - x1)
+    bh = max(1, y2 - y1)
+    if bh < 80:
+        return
+    px1 = int(x1 + 0.28 * bw)
+    px2 = int(x1 + 0.72 * bw)
+    py1 = int(y1 + 0.72 * bh)
+    py2 = int(y2 - 0.08 * bh)
+    px1 = max(0, px1); py1 = max(0, py1)
+    px2 = min(img.shape[1], px2); py2 = min(img.shape[0], py2)
+    if px2 <= px1 or py2 <= py1:
+        return
+    cv2.rectangle(img, (px1, py1), (px2, py2), (0, 0, 0), -1)
+
+def roi_from_poly(poly_px, w, h, pad_x=0.03, pad_y=0.35):
     xs = [p[0] for p in poly_px]
     ys = [p[1] for p in poly_px]
     x1, x2 = max(0, min(xs)), min(w - 1, max(xs))
@@ -251,58 +279,7 @@ class ReferenceHomographyWarp:
         return self.H, True
 
 
-def class_min_conf(cls_name):
-    if cls_name == "car": return CAR_MIN_CONF
-    if cls_name == "motorcycle": return MOTO_MIN_CONF
-    if cls_name == "bus": return BUS_MIN_CONF
-    if cls_name == "truck": return TRUCK_MIN_CONF
-    return 0.0
-
-def should_mask(bbox_xyxy, img_h, cls_name):
-    if not MASK_PLATE:
-        return False
-    if cls_name == "motorcycle":
-        return False
-    x1, y1, x2, y2 = bbox_xyxy
-    bh = max(0.0, y2 - y1)
-    return (y2 >= img_h * MASK_NEAR_Y2_NORM) or (bh >= MASK_NEAR_MIN_H)
-
-def mask_plate(img, bbox):
-    x1, y1, x2, y2 = bbox
-    x1 = int(max(0, x1)); y1 = int(max(0, y1))
-    x2 = int(min(img.shape[1] - 1, x2)); y2 = int(min(img.shape[0] - 1, y2))
-    if x2 <= x1 or y2 <= y1:
-        return
-    bw = max(1, x2 - x1)
-    bh = max(1, y2 - y1)
-    if bh < 80:
-        return
-    px1 = int(x1 + 0.28 * bw)
-    px2 = int(x1 + 0.72 * bw)
-    py1 = int(y1 + 0.72 * bh)
-    py2 = int(y2 - 0.08 * bh)
-    px1 = max(0, px1); py1 = max(0, py1)
-    px2 = min(img.shape[1], px2); py2 = min(img.shape[0], py2)
-    if px2 <= px1 or py2 <= py1:
-        return
-    cv2.rectangle(img, (px1, py1), (px2, py2), (0, 0, 0), -1)
-
-def point_in_poly(px, py, poly):
-    contour = np.array(poly, dtype=np.int32).reshape(-1, 1, 2)
-    return cv2.pointPolygonTest(contour, (float(px), float(py)), False) >= 0
-
-def assign_lane_bottom_center(bbox, lanes_px):
-    x1, y1, x2, y2 = bbox
-    cx = int((x1 + x2) / 2)
-    cy = int(y2)
-    for lane in lanes_px:
-        if point_in_poly(cx, cy, lane["poly"]):
-            return lane["id"]
-    return None
-
-
 def pick_device():
-    # Fix lỗi CUDA: chỉ bật half nếu GPU thật
     if torch is None:
         return "cpu", False
     try:
@@ -312,9 +289,7 @@ def pick_device():
         pass
     return "cpu", False
 
-
 def iou_xyxy(a, b):
-    # a: (4,), b: (N,4) or (4,)
     ax1, ay1, ax2, ay2 = a
     bx1 = b[:, 0]; by1 = b[:, 1]; bx2 = b[:, 2]; by2 = b[:, 3]
     inter_x1 = np.maximum(ax1, bx1)
@@ -328,6 +303,12 @@ def iou_xyxy(a, b):
     area_b = np.maximum(0.0, bx2 - bx1) * np.maximum(0.0, by2 - by1)
     union = area_a + area_b - inter + 1e-8
     return inter / union
+
+def on_road_bottom_center(bbox_xyxy, road_cnt):
+    x1, y1, x2, y2 = bbox_xyxy
+    cx = (x1 + x2) * 0.5
+    cy = y2
+    return cv2.pointPolygonTest(road_cnt, (float(cx), float(cy)), False) >= 0
 
 
 def main():
@@ -360,8 +341,8 @@ def main():
 
     warp = ReferenceHomographyWarp(f0, road_ref_px) if USE_WARP else None
 
-    model = YOLO(YOLO_WEIGHTS)      # for track (near)
-    model_far = YOLO(YOLO_WEIGHTS)  # for predict (far)
+    model = YOLO(YOLO_WEIGHTS)
+    model_far = YOLO(YOLO_WEIGHTS)
     try:
         model.fuse()
         model_far.fuse()
@@ -373,8 +354,6 @@ def main():
 
     cv2.namedWindow("ITS Stream", cv2.WINDOW_NORMAL)
 
-    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-
     frame_idx = 0
     fps_ema = 0.0
     last_t = time.perf_counter()
@@ -382,7 +361,6 @@ def main():
     total_hist = deque(maxlen=PROF_SMOOTH_N)
     last_prof_print = time.perf_counter()
 
-    # cache FAR results between frames (so boxes don't "blink")
     far_cache_xyxy = np.zeros((0, 4), dtype=np.float32)
     far_cache_cls = np.zeros((0,), dtype=int)
     far_cache_conf = np.zeros((0,), dtype=np.float32)
@@ -391,20 +369,17 @@ def main():
     while True:
         t0 = time.perf_counter()
 
-        # READ
         t_read0 = time.perf_counter()
         ret, frame = cap.read()
         t_read_ms = (time.perf_counter() - t_read0) * 1000.0
         if not ret:
             break
 
-        # manual stride skip
         if VID_STRIDE > 1:
             for _ in range(VID_STRIDE - 1):
                 if not cap.grab():
                     break
 
-        # RESIZE
         t_rs0 = time.perf_counter()
         if WORK_SCALE != 1.0:
             frame = cv2.resize(frame, None, fx=WORK_SCALE, fy=WORK_SCALE, interpolation=cv2.INTER_AREA)
@@ -413,7 +388,6 @@ def main():
         frame_idx += 1
         out = frame.copy()
 
-        # WARP
         t_warp0 = time.perf_counter()
         H = np.eye(3, dtype=np.float32)
         warp_ok = True
@@ -425,17 +399,15 @@ def main():
                 warp_ok = warp.last_good
         t_warp_ms = (time.perf_counter() - t_warp0) * 1000.0
 
-        # lanes (current)
         road_cur_px = warp_points(road_ref_px, H)
+        road_cnt = np.array(road_cur_px, dtype=np.int32).reshape(-1, 1, 2)
         lanes_cur_px = [{"id": ln["id"], "type": ln["type"], "poly": warp_points(ln["poly"], H)} for ln in lanes_ref_px]
 
-        # draw lanes
-        cv2.polylines(out, [np.array(road_cur_px, np.int32).reshape(-1, 1, 2)], True, (255, 255, 0), 2)
+        cv2.polylines(out, [road_cnt], True, (255, 255, 0), 2)
         for lane in lanes_cur_px:
             col = (255, 0, 0) if lane["type"] == "car" else (0, 255, 255)
             cv2.polylines(out, [np.array(lane["poly"], np.int32).reshape(-1, 1, 2)], True, col, 2)
 
-        # ROI crop (near)
         t_roi0 = time.perf_counter()
         if DETECT_ROI:
             rx1, ry1, rx2, ry2 = roi_from_poly(road_cur_px, Ww, Hh, ROI_PAD_X, ROI_PAD_Y)
@@ -447,7 +419,6 @@ def main():
             rx1, ry1, rx2, ry2 = 0, 0, Ww, Hh
         t_roi_ms = (time.perf_counter() - t_roi0) * 1000.0
 
-        # ===== PASS 1: NEAR track =====
         t_y0 = time.perf_counter()
         track_kwargs = dict(
             persist=True,
@@ -477,24 +448,20 @@ def main():
             near_conf = boxes.conf.cpu().numpy().astype(np.float32) if boxes.conf is not None else np.ones((len(near_xyxy),), dtype=np.float32)
             near_ids = None if boxes.id is None else boxes.id.cpu().numpy().astype(int)
 
-        # offset near boxes back to full frame
         if len(near_xyxy) > 0:
             near_xyxy[:, [0, 2]] += float(offx)
             near_xyxy[:, [1, 3]] += float(offy)
 
-        # ===== PASS 2: FAR predict (multi-scale) =====
         t_far_ms = 0.0
         if ENABLE_FAR_PASS:
             far_cache_age += 1
 
-            # define far ROI = top part of ROI, then upscale by FAR_IMGSZ inside predict()
             roi_h = max(1, (ry2 - ry1))
             far_y1 = ry1
             far_y2 = ry1 + int(roi_h * FAR_TOP_FRAC)
             far_x1 = rx1
             far_x2 = rx2
 
-            # clamp
             far_y1 = max(0, min(Hh - 1, far_y1))
             far_y2 = max(0, min(Hh, far_y2))
             far_x1 = max(0, min(Ww - 1, far_x1))
@@ -530,24 +497,33 @@ def main():
                     far_cls = fboxes.cls.cpu().numpy().astype(int)
                     far_conf = fboxes.conf.cpu().numpy().astype(np.float32) if fboxes.conf is not None else np.ones((len(far_xyxy),), dtype=np.float32)
 
-                # offset to full frame
                 if len(far_xyxy) > 0:
                     far_xyxy[:, [0, 2]] += float(far_x1)
                     far_xyxy[:, [1, 3]] += float(far_y1)
 
-                # cache it (so it doesn't blink between far frames)
+                    keep = []
+                    for k in range(len(far_xyxy)):
+                        if on_road_bottom_center(far_xyxy[k], road_cnt):
+                            keep.append(k)
+                    if keep:
+                        far_xyxy = far_xyxy[keep]
+                        far_cls = far_cls[keep]
+                        far_conf = far_conf[keep]
+                    else:
+                        far_xyxy = np.zeros((0, 4), dtype=np.float32)
+                        far_cls = np.zeros((0,), dtype=int)
+                        far_conf = np.zeros((0,), dtype=np.float32)
+
                 far_cache_xyxy = far_xyxy
                 far_cache_cls = far_cls
                 far_cache_conf = far_conf
                 far_cache_age = 0
 
-        # if cache too old, drop it
         if far_cache_age > max(2, FAR_EVERY * 2):
             far_cache_xyxy = np.zeros((0, 4), dtype=np.float32)
             far_cache_cls = np.zeros((0,), dtype=int)
             far_cache_conf = np.zeros((0,), dtype=np.float32)
 
-        # ===== MERGE: add FAR boxes that are not already covered by NEAR =====
         merged_xyxy = near_xyxy
         merged_cls = near_cls
         merged_conf = near_conf
@@ -572,35 +548,34 @@ def main():
                 merged_cls = np.concatenate([merged_cls, far_k_cls], axis=0) if len(merged_cls) else far_k_cls
                 merged_conf = np.concatenate([merged_conf, far_k_conf], axis=0) if len(merged_conf) else far_k_conf
 
-                # FAR ids are negative (unique)
                 far_ids = -100000 - np.arange(len(far_k_xyxy), dtype=int)
                 if merged_ids is None and len(near_xyxy) > 0:
-                    # if tracker didn't return ids, create temp for near
                     merged_ids = np.arange(1, len(near_xyxy) + 1, dtype=int)
                 if merged_ids is None:
                     merged_ids = far_ids
                 else:
                     merged_ids = np.concatenate([merged_ids, far_ids], axis=0)
 
-        # ===== POSTPROCESS + DRAW =====
         t_post0 = time.perf_counter()
         violations = 0
         kept = 0
 
         for i in range(len(merged_xyxy)):
+            x1, y1, x2, y2 = merged_xyxy[i]
+            if not on_road_bottom_center((x1, y1, x2, y2), road_cnt):
+                continue
+
             cls_id = int(merged_cls[i])
             cls_name = model.names.get(cls_id, str(cls_id))
             if cls_name == "motorbike":
                 cls_name = "motorcycle"
             c = float(merged_conf[i])
-
             if c < class_min_conf(cls_name):
                 continue
 
             kept += 1
             tid = int(merged_ids[i]) if merged_ids is not None else (i + 1)
 
-            x1, y1, x2, y2 = merged_xyxy[i]
             lane_id = assign_lane_bottom_center((x1, y1, x2, y2), lanes_cur_px)
             allowed = allowed_lanes_by_cls.get(cls_name, set())
             is_viol = (lane_id is not None) and (len(allowed) > 0) and (lane_id not in allowed)
@@ -612,7 +587,6 @@ def main():
 
             color = (0, 0, 255) if is_viol else (0, 255, 0)
             ix1, iy1, ix2, iy2 = int(x1), int(y1), int(x2), int(y2)
-
             ix1 = max(0, min(Ww - 1, ix1))
             iy1 = max(0, min(Hh - 1, iy1))
             ix2 = max(0, min(Ww - 1, ix2))
@@ -630,7 +604,6 @@ def main():
 
         t_post_ms = (time.perf_counter() - t_post0) * 1000.0
 
-        # FPS EMA
         now = time.perf_counter()
         dt = max(1e-6, now - last_t)
         inst_fps = 1.0 / dt
@@ -640,15 +613,13 @@ def main():
         inl = warp.last_inlier if (USE_WARP and warp is not None) else 0.0
         goodm = warp.last_good_matches if (USE_WARP and warp is not None) else 0
 
-        # HUD
         cv2.putText(out,
                     f"fps={fps_ema:.1f} near={yolo_ms:.0f}ms far={t_far_ms:.0f}ms kept={kept} viol={violations}",
                     (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2, cv2.LINE_AA)
         cv2.putText(out,
-                    f"warp={'OK' if warp_ok else 'HOLD'} inl={inl:.2f} good={goodm} stride={VID_STRIDE} farEvery={FAR_EVERY}",
+                    f"warp={'OK' if warp_ok else 'HOLD'} inl={inl:.2f} good={goodm} farEvery={FAR_EVERY}",
                     (20, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2, cv2.LINE_AA)
 
-        # display
         t_disp0 = time.perf_counter()
         disp = out
         if DISPLAY_SCALE != 1.0:
@@ -656,7 +627,6 @@ def main():
         cv2.imshow("ITS Stream", disp)
         t_disp_ms = (time.perf_counter() - t_disp0) * 1000.0
 
-        # profiler
         t_total_ms = (time.perf_counter() - t0) * 1000.0
         total_hist.append(t_total_ms)
         avg_ms = sum(total_hist) / len(total_hist)
