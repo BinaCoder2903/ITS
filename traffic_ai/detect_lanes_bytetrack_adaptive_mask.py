@@ -1,7 +1,40 @@
-from ultralytics import YOLO
-import cv2, os, time, csv
+import os
+import time, csv
+import cv2
 import numpy as np
 from collections import deque
+import threading
+import queue
+
+CPU_CORES = os.cpu_count() or 4
+N_THREADS = max(1, CPU_CORES - 1)
+
+os.environ["OMP_NUM_THREADS"] = str(N_THREADS)
+os.environ["MKL_NUM_THREADS"] = str(N_THREADS)
+os.environ["OPENBLAS_NUM_THREADS"] = str(N_THREADS)
+os.environ["NUMEXPR_NUM_THREADS"] = str(N_THREADS)
+
+try:
+    cv2.setUseOptimized(True)
+except Exception:
+    pass
+try:
+    cv2.setNumThreads(N_THREADS)
+except Exception:
+    pass
+
+try:
+    import torch
+    torch.set_num_threads(N_THREADS)
+    try:
+        torch.set_num_interop_threads(1)
+    except Exception:
+        pass
+except Exception:
+    torch = None
+
+from ultralytics import YOLO
+
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 VIDEO_SOURCE = os.path.join(BASE_DIR, "data", "video", "test 3.mp4")
@@ -68,21 +101,6 @@ DRAW_TEXT = False
 ENABLE_PROFILER = True
 PROF_PRINT_EVERY_SEC = 0.25
 PROF_SMOOTH_N = 30
-
-try:
-    cv2.setUseOptimized(True)
-except Exception:
-    pass
-try:
-    cv2.setNumThreads(1)
-except Exception:
-    pass
-
-try:
-    import torch
-    torch.set_num_threads(1)
-except Exception:
-    torch = None
 
 
 def lerp(p1, p2, t):
@@ -270,14 +288,13 @@ class ReferenceHomographyWarp:
             self.last_good = True
             return self.H, True
 
-        H_old = self.H / (self.H[2, 2] + 1e-8)
+        H_old = self.H / (H_old := (self.H[2, 2] + 1e-8))
         H_blend = (1.0 - SMOOTH_GAMMA) * H_old + SMOOTH_GAMMA * H_new
         H_blend = H_blend / (H_blend[2, 2] + 1e-8)
 
         self.H = H_blend
         self.last_good = True
         return self.H, True
-
 
 def pick_device():
     if torch is None:
@@ -311,6 +328,49 @@ def on_road_bottom_center(bbox_xyxy, road_cnt):
     return cv2.pointPolygonTest(road_cnt, (float(cx), float(cy)), False) >= 0
 
 
+class FrameQueue:
+    def __init__(self, maxsize=4):
+        self.q = queue.Queue(maxsize=maxsize)
+        self.ended = False
+
+    def push(self, frame, idx):
+        if self.ended:
+            return
+        self.q.put((idx, frame))
+
+    def pop(self, stop_event):
+        while not stop_event.is_set():
+            try:
+                return self.q.get(timeout=0.05)
+            except queue.Empty:
+                if self.ended:
+                    return None, None
+        return None, None
+
+    def set_ended(self):
+        self.ended = True
+
+
+def capture_loop(cap, fq: FrameQueue, stop_event: threading.Event):
+    idx = 0
+    while not stop_event.is_set():
+        ret, frame = cap.read()
+        if not ret:
+            fq.set_ended()
+            break
+
+        if VID_STRIDE > 1:
+            for _ in range(VID_STRIDE - 1):
+                if not cap.grab():
+                    break
+
+        if WORK_SCALE != 1.0:
+            frame = cv2.resize(frame, None, fx=WORK_SCALE, fy=WORK_SCALE, interpolation=cv2.INTER_AREA)
+
+        idx += 1
+        fq.push(frame, idx)
+
+
 def main():
     log_f, log_w = None, None
     if SAVE_VIOLATIONS:
@@ -325,6 +385,10 @@ def main():
     if not cap.isOpened():
         print("[ERROR] Cannot open:", VIDEO_SOURCE)
         return
+    try:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    except Exception:
+        pass
 
     ret, f0 = cap.read()
     if not ret:
@@ -350,11 +414,16 @@ def main():
         pass
 
     device, use_half = pick_device()
-    print(f"[INFO] device={device} half={use_half} IMGSZ={IMGSZ} MAX_DET={MAX_DET} FAR={ENABLE_FAR_PASS}")
+    print(f"[INFO] device={device} half={use_half} threads={N_THREADS}")
 
     cv2.namedWindow("ITS Stream", cv2.WINDOW_NORMAL)
 
-    frame_idx = 0
+    fq = FrameQueue(maxsize=4)
+    stop_event = threading.Event()
+
+    tcap = threading.Thread(target=capture_loop, args=(cap, fq, stop_event), daemon=True)
+    tcap.start()
+
     fps_ema = 0.0
     last_t = time.perf_counter()
 
@@ -366,26 +435,15 @@ def main():
     far_cache_conf = np.zeros((0,), dtype=np.float32)
     far_cache_age = 0
 
+    frame_idx = 0
+
     while True:
         t0 = time.perf_counter()
 
-        t_read0 = time.perf_counter()
-        ret, frame = cap.read()
-        t_read_ms = (time.perf_counter() - t_read0) * 1000.0
-        if not ret:
+        frame_idx, frame = fq.pop(stop_event)
+        if frame is None:
             break
 
-        if VID_STRIDE > 1:
-            for _ in range(VID_STRIDE - 1):
-                if not cap.grab():
-                    break
-
-        t_rs0 = time.perf_counter()
-        if WORK_SCALE != 1.0:
-            frame = cv2.resize(frame, None, fx=WORK_SCALE, fy=WORK_SCALE, interpolation=cv2.INTER_AREA)
-        t_rs_ms = (time.perf_counter() - t_rs0) * 1000.0
-
-        frame_idx += 1
         out = frame.copy()
 
         t_warp0 = time.perf_counter()
@@ -570,6 +628,7 @@ def main():
             if cls_name == "motorbike":
                 cls_name = "motorcycle"
             c = float(merged_conf[i])
+
             if c < class_min_conf(cls_name):
                 continue
 
@@ -635,14 +694,21 @@ def main():
         if ENABLE_PROFILER and (time.perf_counter() - last_prof_print) >= PROF_PRINT_EVERY_SEC:
             print(
                 f"ms total={t_total_ms:.1f}(avg={avg_ms:.1f},FPS~{fps_est:.1f}) "
-                f"| read={t_read_ms:.1f} rs={t_rs_ms:.1f} warp={t_warp_ms:.1f} roi={t_roi_ms:.1f} "
-                f"near={yolo_ms:.1f} far={t_far_ms:.1f} post={t_post_ms:.1f} disp={t_disp_ms:.1f}",
+                f"| warp={t_warp_ms:.1f} roi={t_roi_ms:.1f} near={yolo_ms:.1f} far={t_far_ms:.1f} post={t_post_ms:.1f} disp={t_disp_ms:.1f}",
                 end="\r"
             )
             last_prof_print = time.perf_counter()
 
-        if (cv2.waitKey(1) & 0xFF) == ord("q"):
+        k = cv2.waitKey(1) & 0xFF
+        if k == ord("q"):
+            stop_event.set()
             break
+
+    stop_event.set()
+    try:
+        tcap.join(timeout=1.0)
+    except Exception:
+        pass
 
     cap.release()
     cv2.destroyAllWindows()
